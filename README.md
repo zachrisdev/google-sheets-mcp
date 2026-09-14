@@ -9,10 +9,33 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that gi
 | `read_sheet` | Read data from any range in a spreadsheet |
 | `write_sheet` | Write or update data in a spreadsheet |
 | `append_rows` | Append new rows to a spreadsheet |
+| `insert_rows` | Insert rows at a 0-based index |
 | `get_sheet_info` | Get sheet names, row counts, and column counts |
 | `clear_range` | Clear a range of cells |
+| `query_sheet` | SQLite `SELECT` on a tab (Sheets API → ephemeral sql.js). Cols A/B/C…; `FROM` optional. Aggregations OK. Ignores UI basicFilter. |
+| `update_where` | Filter + update rows in one call (no row indices) |
 
 All tools accept a full Google Sheets URL **or** a bare spreadsheet ID.
+
+**Decimal text guard:** write tools reject strings that use the *foreign* decimal separator for the spreadsheet’s locale (e.g. `"29.3"` on `hu_HU`, `"29,3"` on `en_US` under USER_ENTERED → TEXT). Locale comes from `spreadsheets.properties.locale` (cached). Pass a JSON number, or set `allow_text_numerics: true`. See `type-guards.js`.
+
+**Write dedupe (DEV-TODO 32):** optional `request_id` on write tools; identical payload / same id within ~5 min returns prior success without a second Sheets write. stderr: `[WRITE_START]` / `[WRITE_DONE]`. See `write-dedupe.js` and `docs/SKILL_GOTCHA_DEVTODO32.md`.
+
+### query_sheet notes
+
+- Data source: `spreadsheets.values.get` (same as `update_where`) — **not** GViz `/gviz/tq` (GViz respected UI filters → silent false negatives).
+- Engine: in-memory sql.js per call. Table name = tab name; columns = `A`, `B`, `C`…
+- Examples: `SELECT C, COUNT(*) WHERE C = 'AMZN' GROUP BY C`; `SELECT * WHERE C = 'AXON' ORDER BY A DESC LIMIT 20`
+
+### Tests
+
+```bash
+npm run test:unit                  # includes sql.js + filter-safety + text-numerics
+npm run test:integration:local     # needs mcp-http-gateway v2 on :3302 + token.json
+MCP_TEST_BASE=https://YOUR_DOMAIN npm run test:integration:live
+npm run test:smoke:sql             # temp sheet + sql.js (needs token.json)
+npm run audit:text-numerics -- --spreadsheet-id=ID   # dry-run; add --apply to fix
+```
 
 ---
 

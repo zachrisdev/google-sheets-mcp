@@ -14,9 +14,11 @@ const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_u
 
 const authUrl = oAuth2Client.generateAuthUrl({
   access_type: "offline",
+  prompt: "consent",
   scope: [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.file",
   ],
 });
 

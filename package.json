@@ -4,7 +4,12 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "auth": "node auth.js",
+    "test:unit": "node tests/unit-test-update-where.js && node tests/unit-test-hybrid-cells.js && node tests/unit-test-query-sheet-sql.js && node tests/unit-test-filter-safety.js && node tests/unit-test-text-numerics.js && node tests/unit-test-write-dedupe.js",
+    "test:smoke:sql": "node tests/smoke-sql.js",
+    "test:integration:local": "node tests/integration-test-server2-local.js",
+    "test:integration:live": "node tests/integration-test-server2-live.js",
+    "audit:text-numerics": "node scripts/audit-text-numerics.js"
   },
   "keywords": [],
   "author": "",
@@ -12,6 +17,7 @@
   "type": "module",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.28.0",
-    "googleapis": "^171.4.0"
+    "googleapis": "^171.4.0",
+    "sql.js": "^1.14.1"
   }
 }

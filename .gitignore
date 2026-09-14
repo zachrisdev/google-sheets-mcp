@@ -1,4 +1,6 @@
 credentials.json
 token.json
+oauth.txt
+cloude-logs/
 node_modules/
 .DS_Store
