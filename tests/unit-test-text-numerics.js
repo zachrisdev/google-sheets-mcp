@@ -194,7 +194,7 @@ console.log("\nhybrid value + segments:");
   );
 }
 
-console.log("\nassertNoDotDecimalTextInSet (incl. dry_run path):");
+console.log("\nassertNoDotDecimalTextInSet (legacy helper still OK):");
 assertThrows(
   "set F=29.3",
   () =>

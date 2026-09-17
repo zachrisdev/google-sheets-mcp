@@ -13,9 +13,11 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that gi
 | `get_sheet_info` | Get sheet names, row counts, and column counts |
 | `clear_range` | Clear a range of cells |
 | `query_sheet` | SQLite `SELECT` on a tab (Sheets API → ephemeral sql.js). Cols A/B/C…; `FROM` optional. Aggregations OK. Ignores UI basicFilter. |
-| `update_where` | Filter + update rows in one call (no row indices) |
+| `update_where` | Filter + column ops (`operations`: `set` \| `replace`). Safety: `dry_run`, `limit`, `expected_match_count`, `expected_occurrence_count`. Rich text refused. |
 
 All tools accept a full Google Sheets URL **or** a bare spreadsheet ID.
+
+**Breaking change (DEV-TODO 64):** `update_where` top-level `set` removed → `operations`. After upgrade, **re-attach the MCP connector** (Desktop / Claude.ai). See `docs/SKILL_GOTCHA_DEVTODO64.md` and `AI_CONTEXT.md` §5d.
 
 **Decimal text guard:** write tools reject strings that use the *foreign* decimal separator for the spreadsheet’s locale (e.g. `"29.3"` on `hu_HU`, `"29,3"` on `en_US` under USER_ENTERED → TEXT). Locale comes from `spreadsheets.properties.locale` (cached). Pass a JSON number, or set `allow_text_numerics: true`. See `type-guards.js`.
 
@@ -33,6 +35,8 @@ All tools accept a full Google Sheets URL **or** a bare spreadsheet ID.
 npm run test:unit                  # includes sql.js + filter-safety + text-numerics
 npm run test:integration:local     # needs mcp-http-gateway v2 on :3302 + token.json
 MCP_TEST_BASE=https://YOUR_DOMAIN npm run test:integration:live
+# Optional pace/retry vs Sheets free-tier quota:
+#   MCP_TEST_MIN_INTERVAL_MS=600 (default)  MCP_TEST_QUOTA_RETRIES=8 (default)
 npm run test:smoke:sql             # temp sheet + sql.js (needs token.json)
 npm run audit:text-numerics -- --spreadsheet-id=ID   # dry-run; add --apply to fix
 ```

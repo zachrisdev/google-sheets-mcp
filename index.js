@@ -22,11 +22,24 @@ import {
 import { executeSheetSqlQuery } from "./sheet-sql.js";
 import {
   ALLOW_TEXT_NUMERICS_PROP,
-  assertNoDotDecimalTextInSet,
   assertNoDotDecimalTextNumerics,
   getSpreadsheetLocale,
   parseAllowTextNumerics,
 } from "./type-guards.js";
+import {
+  applyReplace,
+  assertCellSizeLimit,
+  assertNoForeignDecimalFinalCell,
+  assertNoForeignDecimalInSetOps,
+  assertNoLeadingFormulaChars,
+  assertNoLegacySetParam,
+  assertOccurrenceBudget,
+  cellHasTextFormatRuns,
+  cellTextForReplace,
+  normalizeOperations,
+  parseAllowFormula,
+  snippetAround,
+} from "./update-where-ops.js";
 import { REQUEST_ID_PROP, withWriteDedupe } from "./write-dedupe.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -92,6 +105,22 @@ export {
   _dedupeSizeForTests,
   DEDUPE_TTL_MS,
 } from "./write-dedupe.js";
+export {
+  applyReplace,
+  assertCellSizeLimit,
+  assertNoForeignDecimalFinalCell,
+  assertNoForeignDecimalInSetOps,
+  assertNoLeadingFormulaChars,
+  assertNoLegacySetParam,
+  assertOccurrenceBudget,
+  cellHasTextFormatRuns,
+  cellTextForReplace,
+  normalizeOperations,
+  parseAllowFormula,
+  snippetAround,
+  MAX_CELL_CHARS,
+  MAX_OCCURRENCES_PER_CALL,
+} from "./update-where-ops.js";
 
 // Auth setup
 async function getAuth() {
@@ -636,9 +665,15 @@ export function createMcpServer() {
       {
         name: "update_where",
         description:
-          "Filter (where) + update cols (set) in one call — use instead of query_sheet+write_sheet; no row indices. " +
-          "Not atomic; read+write back-to-back. ≥1 where required. Safety: dry_run, limit, expected_match_count. " +
-          "Rejects foreign-decimal text numerics in set[].value for the spreadsheet locale (also on dry_run); pass JSON number or allow_text_numerics:true.",
+          "Filter (where) + column ops in one call — use instead of query_sheet+write_sheet; no row indices. " +
+          "HARD BREAK: top-level 'set' removed — use operations[] with op discriminator. " +
+          "ops: set (full overwrite) | replace (literal in-cell find/replace; replace_all default true; no regex). " +
+          "replace targets must be string/empty cells (number/bool/date-serial → error). " +
+          "Cells with textFormatRuns → refused (plain path only; formatting support is a separate backlog). " +
+          "Not atomic; read+write back-to-back. ≥1 where required. Safety: dry_run, limit, expected_match_count, expected_occurrence_count. " +
+          "Rejects foreign-decimal text numerics on set values and on final cell text when the entire cell matches (also on dry_run). " +
+          "Leading = + - @ on set value / post-replace text refused unless allow_formula:true. " +
+          "After schema change: re-attach the MCP connector (Desktop / Claude.ai) so the client picks up operations.",
         inputSchema: {
           type: "object",
           properties: {
@@ -659,25 +694,59 @@ export function createMcpServer() {
               },
             },
             match_mode: { type: "string", description: "Default AND", enum: ["AND", "OR"] },
-            set: {
+            operations: {
               type: "array",
-              description: "Updates per matched row",
+              minItems: 1,
+              description:
+                "ColumnOps (oneOf set|replace). set: {op,column,value}. replace: {op,column,find,replace,replace_all?}",
               items: {
-                type: "object",
-                properties: {
-                  column: { type: "string", description: "Column letter" },
-                  value: { type: ["string", "number", "boolean"], description: "Cell value" },
-                },
-                required: ["column", "value"],
+                oneOf: [
+                  {
+                    type: "object",
+                    properties: {
+                      op: { type: "string", const: "set" },
+                      column: { type: "string", description: "Column letter" },
+                      value: { type: ["string", "number", "boolean"], description: "Full cell overwrite" },
+                    },
+                    required: ["op", "column", "value"],
+                    additionalProperties: false,
+                  },
+                  {
+                    type: "object",
+                    properties: {
+                      op: { type: "string", const: "replace" },
+                      column: { type: "string", description: "Column letter" },
+                      find: { type: "string", minLength: 1, description: "Literal substring (no regex)" },
+                      replace: { type: "string", description: "Replacement (may be empty)" },
+                      replace_all: {
+                        type: "boolean",
+                        description: "Replace every occurrence in the cell (default true)",
+                      },
+                    },
+                    required: ["op", "column", "find", "replace"],
+                    additionalProperties: false,
+                  },
+                ],
               },
             },
-            dry_run: { type: "boolean", description: "Preview matches+current values, no write (default false)" },
+            dry_run: { type: "boolean", description: "Preview matches+snippets, no write (default false)" },
             limit: { type: "integer", description: "Max rows; refuse if exceeded" },
-            expected_match_count: { type: "integer", description: "Abort write if match count differs" },
+            expected_match_count: { type: "integer", description: "Abort if match count differs" },
+            expected_occurrence_count: {
+              type: "integer",
+              description:
+                "Abort if total applied replace occurrences across writable rows differs " +
+                "(counts replacements performed: with replace_all:false, at most 1 per cell)",
+            },
+            allow_formula: {
+              type: "boolean",
+              description:
+                "If true, allow leading = + - @ on set values / post-replace text (USER_ENTERED formulas). Default false.",
+            },
             allow_text_numerics: ALLOW_TEXT_NUMERICS_PROP,
             request_id: REQUEST_ID_PROP,
           },
-          required: ["url_or_id", "sheet", "where", "set"],
+          required: ["url_or_id", "sheet", "where", "operations"],
         },
       },
     ];
@@ -937,8 +1006,8 @@ export function createMcpServer() {
       }
 
       if (name === "update_where") {
+        assertNoLegacySetParam(args);
         let where = args.where;
-        let set = args.set;
         if (typeof where === "string") {
           try {
             where = JSON.parse(where);
@@ -946,29 +1015,34 @@ export function createMcpServer() {
             throw new Error(`Failed to parse 'where' string as JSON: ${e.message}`);
           }
         }
-        if (typeof set === "string") {
-          try {
-            set = JSON.parse(set);
-          } catch (e) {
-            throw new Error(`Failed to parse 'set' string as JSON: ${e.message}`);
-          }
-        }
+        const operations = normalizeOperations(args.operations);
         const dryRun = args.dry_run === true || args.dry_run === "true";
+        const allowFormula = parseAllowFormula(args.allow_formula);
+        const allowTextNumerics = parseAllowTextNumerics(args.allow_text_numerics);
         if (!Array.isArray(where) || where.length === 0) {
           throw new Error("'where' must contain at least one condition (refusing to update an entire column).");
         }
-        if (!Array.isArray(set) || set.length === 0) {
-          throw new Error("'set' must contain at least one column update.");
-        }
-        // Guard before dry_run / sheet read so preview cannot look "OK" then fail on write.
+
         const locale = await getSpreadsheetLocale(sheets, spreadsheetId);
-        assertNoDotDecimalTextInSet(set, {
-          allow: parseAllowTextNumerics(args.allow_text_numerics),
+        assertNoForeignDecimalInSetOps(operations, {
+          allow: allowTextNumerics,
           toolName: "update_where",
           locale,
         });
+        for (let i = 0; i < operations.length; i++) {
+          const op = operations[i];
+          if (op.op === "set" && typeof op.value === "string") {
+            assertNoLeadingFormulaChars(op.value, {
+              allowFormula,
+              path: `operations[${i}] set ${op.column}`,
+            });
+          }
+        }
+
         const headerRows = args.header_rows !== undefined ? parseInt(args.header_rows) : 0;
         const matchMode = String(args.match_mode || "AND").toUpperCase() === "OR" ? "OR" : "AND";
+        const hasReplace = operations.some((o) => o.op === "replace");
+        const hasSet = operations.some((o) => o.op === "set");
 
         return await withWriteDedupe({
           tool: "update_where",
@@ -978,17 +1052,18 @@ export function createMcpServer() {
           fingerprintPayload: {
             sheet: args.sheet,
             where,
-            set,
+            operations,
             matchMode,
             headerRows,
             expected_match_count: args.expected_match_count ?? null,
+            expected_occurrence_count: args.expected_occurrence_count ?? null,
             limit: args.limit ?? null,
+            allow_formula: allowFormula,
           },
           run: async () => {
-            // Read only the span from column A to the right-most referenced column.
             const maxColIndex = Math.max(
               ...where.map((c) => colLetterToIndex(c.column)),
-              ...set.map((c) => colLetterToIndex(c.column))
+              ...operations.map((c) => colLetterToIndex(c.column))
             );
             const readRange = `${args.sheet}!A:${colIndexToLetter(maxColIndex)}`;
 
@@ -999,79 +1074,251 @@ export function createMcpServer() {
             });
             const values = res.data.values || [];
 
-            // Resolve physical (1-based) rows that match, freshly right before writing.
-            const matched = [];
+            const whereMatched = [];
             for (let i = headerRows; i < values.length; i++) {
-              if (rowMatches(values[i], where, matchMode)) matched.push(i + 1);
+              if (rowMatches(values[i], where, matchMode)) whereMatched.push(i + 1);
             }
 
-            // Preconditions — any failure means NOTHING is written.
-            if (args.expected_match_count !== undefined && matched.length !== parseInt(args.expected_match_count)) {
+            /** @type {Array<{ rowNum: number, writes: Array<{ column: string, value: unknown }>, replacePreview: Array<object> }>} */
+            const planned = [];
+            let totalOccurrences = 0;
+
+            for (const rowNum of whereMatched) {
+              const row = values[rowNum - 1] || [];
+              const writes = [];
+              const replacePreview = [];
+              let rowHasWrite = false;
+
+              for (let oi = 0; oi < operations.length; oi++) {
+                const op = operations[oi];
+                const colIdx = colLetterToIndex(op.column);
+                const cellRaw = row[colIdx];
+
+                if (op.op === "set") {
+                  const finalVal = op.value;
+                  if (typeof finalVal === "string") {
+                    assertCellSizeLimit(finalVal, `operations[${oi}] set ${op.column}`);
+                    assertNoForeignDecimalFinalCell(finalVal, {
+                      allow: allowTextNumerics,
+                      toolName: "update_where",
+                      locale,
+                      path: `operations[${oi}] set ${op.column}`,
+                    });
+                  }
+                  writes.push({ column: op.column, value: finalVal });
+                  rowHasWrite = true;
+                  continue;
+                }
+
+                // replace
+                const cellText = cellTextForReplace(
+                  cellRaw,
+                  `row ${rowNum} col ${op.column}`
+                );
+                if (!cellText.includes(op.find)) continue;
+
+                const { text: newText, occurrences } = applyReplace(
+                  cellText,
+                  op.find,
+                  op.replace,
+                  op.replace_all
+                );
+                assertCellSizeLimit(newText, `operations[${oi}] replace ${op.column} row ${rowNum}`);
+                assertNoLeadingFormulaChars(newText, {
+                  allowFormula,
+                  path: `operations[${oi}] replace ${op.column} row ${rowNum}`,
+                });
+                assertNoForeignDecimalFinalCell(newText, {
+                  allow: allowTextNumerics,
+                  toolName: "update_where",
+                  locale,
+                  path: `operations[${oi}] replace ${op.column} row ${rowNum}`,
+                });
+                totalOccurrences += occurrences;
+                writes.push({ column: op.column, value: newText });
+                replacePreview.push({
+                  column: op.column,
+                  find: op.find,
+                  occurrences,
+                  snippet: snippetAround(cellText, op.find),
+                  before: cellText,
+                  after: newText,
+                });
+                rowHasWrite = true;
+              }
+
+              if (rowHasWrite) {
+                planned.push({ rowNum, writes, replacePreview });
+              }
+            }
+
+            // Match basis for expected_match_count / limit:
+            // replace-only → rows that receive at least one replace write
+            // set (or mixed) → all where-matched (set always writes)
+            const matchBasis = hasReplace && !hasSet
+              ? planned.map((p) => p.rowNum)
+              : whereMatched;
+
+            if (args.expected_match_count !== undefined && matchBasis.length !== parseInt(args.expected_match_count)) {
               return {
                 content: [{ type: "text", text: JSON.stringify({
-                  matched_rows: matched.length,
+                  matched_rows: matchBasis.length,
                   updated_rows: 0,
-                  matched_row_numbers: matched,
-                  dry_run: false,
-                  summary: `Precondition failed: expected_match_count=${parseInt(args.expected_match_count)} but ${matched.length} row(s) matched. Nothing was written.`,
+                  matched_row_numbers: matchBasis,
+                  where_matched_rows: whereMatched.length,
+                  dry_run: dryRun,
+                  summary: `Precondition failed: expected_match_count=${parseInt(args.expected_match_count)} but ${matchBasis.length} row(s) matched. Nothing was written.`,
                 }, null, 2) }],
                 isError: true,
               };
             }
-            if (args.limit !== undefined && matched.length > parseInt(args.limit)) {
+            if (args.limit !== undefined && matchBasis.length > parseInt(args.limit)) {
               return {
                 content: [{ type: "text", text: JSON.stringify({
-                  matched_rows: matched.length,
+                  matched_rows: matchBasis.length,
                   updated_rows: 0,
-                  matched_row_numbers: matched,
-                  dry_run: false,
-                  summary: `Refused: ${matched.length} row(s) matched, exceeding limit=${parseInt(args.limit)}. Nothing was written.`,
+                  matched_row_numbers: matchBasis,
+                  dry_run: dryRun,
+                  summary: `Refused: ${matchBasis.length} row(s) matched, exceeding limit=${parseInt(args.limit)}. Nothing was written.`,
+                }, null, 2) }],
+                isError: true,
+              };
+            }
+            if (args.expected_occurrence_count !== undefined) {
+              const expectedOcc = parseInt(args.expected_occurrence_count);
+              if (totalOccurrences !== expectedOcc) {
+                return {
+                  content: [{ type: "text", text: JSON.stringify({
+                    matched_rows: matchBasis.length,
+                    updated_rows: 0,
+                    matched_row_numbers: matchBasis,
+                    occurrence_count: totalOccurrences,
+                    dry_run: dryRun,
+                    summary: `Precondition failed: expected_occurrence_count=${expectedOcc} but ${totalOccurrences} applied occurrence(s). Nothing was written.`,
+                  }, null, 2) }],
+                  isError: true,
+                };
+              }
+            }
+
+            try {
+              assertOccurrenceBudget(totalOccurrences);
+            } catch (e) {
+              return {
+                content: [{ type: "text", text: JSON.stringify({
+                  matched_rows: matchBasis.length,
+                  updated_rows: 0,
+                  matched_row_numbers: matchBasis,
+                  occurrence_count: totalOccurrences,
+                  dry_run: dryRun,
+                  summary: e.message,
                 }, null, 2) }],
                 isError: true,
               };
             }
 
-            if (matched.length === 0) {
+            if (matchBasis.length === 0) {
               return {
                 content: [{ type: "text", text: JSON.stringify({
                   matched_rows: 0,
                   updated_rows: 0,
                   matched_row_numbers: [],
+                  where_matched_rows: whereMatched.length,
                   dry_run: dryRun,
-                  summary: "No rows matched the filter — nothing was updated.",
+                  summary: hasReplace && !hasSet
+                    ? "No rows matched the filter with find substring — nothing was updated."
+                    : "No rows matched the filter — nothing was updated.",
                 }, null, 2) }],
               };
+            }
+
+            // Rich-text refuse on planned write targets (partial gridData; also on dry_run).
+            const richTargets = [];
+            const seen = new Set();
+            for (const p of planned) {
+              for (const w of p.writes) {
+                const key = `${w.column}:${p.rowNum}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                richTargets.push({ column: w.column, rowNum: p.rowNum });
+              }
+            }
+            if (richTargets.length > 0) {
+              const ranges = richTargets.map(
+                (t) => `${args.sheet}!${t.column}${t.rowNum}`
+              );
+              const gridRes = await sheets.spreadsheets.get({
+                spreadsheetId,
+                ranges,
+                includeGridData: true,
+                fields: "sheets.data.rowData.values.textFormatRuns",
+              });
+              const dataBlocks = gridRes.data.sheets?.[0]?.data || [];
+              for (let i = 0; i < richTargets.length; i++) {
+                const cellData = dataBlocks[i]?.rowData?.[0]?.values?.[0];
+                if (cellHasTextFormatRuns(cellData)) {
+                  const t = richTargets[i];
+                  return {
+                    content: [{ type: "text", text: JSON.stringify({
+                      matched_rows: matchBasis.length,
+                      updated_rows: 0,
+                      matched_row_numbers: matchBasis,
+                      dry_run: dryRun,
+                      summary:
+                        `Refused: cell ${t.column}${t.rowNum} has textFormatRuns (rich text). ` +
+                        `update_where v1 is plain-value only. Nothing was written.`,
+                    }, null, 2) }],
+                    isError: true,
+                  };
+                }
+              }
             }
 
             if (dryRun) {
-              const preview = matched.map((rowNum) => {
-                const row = values[rowNum - 1] || [];
+              const preview = planned.map((p) => {
+                const row = values[p.rowNum - 1] || [];
                 const current = {};
-                for (const c of [...where, ...set]) {
+                for (const c of where) {
                   const idx = colLetterToIndex(c.column);
                   current[c.column] = row[idx] !== undefined ? row[idx] : null;
                 }
-                return { _row: rowNum, current };
+                for (const w of p.writes) {
+                  const idx = colLetterToIndex(w.column);
+                  current[w.column] = row[idx] !== undefined ? row[idx] : null;
+                }
+                return {
+                  _row: p.rowNum,
+                  current,
+                  would_write: p.writes,
+                  replace: p.replacePreview.length ? p.replacePreview : undefined,
+                };
               });
               return {
                 content: [{ type: "text", text: JSON.stringify({
-                  matched_rows: matched.length,
+                  matched_rows: matchBasis.length,
                   updated_rows: 0,
-                  matched_row_numbers: matched,
+                  matched_row_numbers: matchBasis,
+                  occurrence_count: totalOccurrences,
                   dry_run: true,
                   preview,
-                  summary: `Dry run: ${matched.length} row(s) would be updated. Nothing was written.`,
+                  summary: `Dry run: ${matchBasis.length} row(s) would be updated` +
+                    (hasReplace ? ` (${totalOccurrences} replace occurrence(s))` : "") +
+                    `. Nothing was written.`,
                 }, null, 2) }],
               };
             }
 
-            // Build a single batch of cell writes: matched rows x set entries.
-            const data = [];
-            for (const rowNum of matched) {
-              for (const s of set) {
-                data.push({ range: `${args.sheet}!${String(s.column).toUpperCase()}${rowNum}`, values: [[s.value]] });
+            // Collapse multiple writes to same cell (last wins) then batchUpdate.
+            const dataMap = new Map();
+            for (const p of planned) {
+              for (const w of p.writes) {
+                dataMap.set(
+                  `${w.column}${p.rowNum}`,
+                  { range: `${args.sheet}!${w.column}${p.rowNum}`, values: [[w.value]] }
+                );
               }
             }
+            const data = [...dataMap.values()];
             await sheets.spreadsheets.values.batchUpdate({
               spreadsheetId,
               requestBody: { valueInputOption: "USER_ENTERED", data },
@@ -1079,11 +1326,12 @@ export function createMcpServer() {
 
             return {
               content: [{ type: "text", text: JSON.stringify({
-                matched_rows: matched.length,
-                updated_rows: matched.length,
-                matched_row_numbers: matched,
+                matched_rows: matchBasis.length,
+                updated_rows: matchBasis.length,
+                matched_row_numbers: matchBasis,
+                occurrence_count: totalOccurrences,
                 dry_run: false,
-                summary: `Updated ${matched.length} row(s): ${matched.join(", ")}.`,
+                summary: `Updated ${matchBasis.length} row(s): ${matchBasis.join(", ")}.`,
               }, null, 2) }],
             };
           },

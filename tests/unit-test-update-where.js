@@ -68,7 +68,7 @@ function assertThrows(label, fn, msgIncludes) {
 
 // Helper mirroring handler core: computes matching physical rows and batch data.
 // (If index.js handler logic changes, update this too.)
-function resolveUpdate(values, { sheet, where, set, headerRows = 0, matchMode = "AND", limit, expectedMatchCount }) {
+function resolveUpdate(values, { sheet, where, operations, headerRows = 0, matchMode = "AND", limit, expectedMatchCount }) {
   const matched = [];
   for (let i = headerRows; i < values.length; i++) {
     if (rowMatches(values[i], where, matchMode)) matched.push(i + 1);
@@ -84,7 +84,7 @@ function resolveUpdate(values, { sheet, where, set, headerRows = 0, matchMode = 
   }
   const data = [];
   for (const rowNum of matched) {
-    for (const s of set) {
+    for (const s of operations) {
       data.push({ range: `${sheet}!${String(s.column).toUpperCase()}${rowNum}`, values: [[s.value]] });
     }
   }
@@ -205,7 +205,7 @@ const r1 = resolveUpdate(sheetValues, {
   sheet: "Sheet1",
   headerRows: 1,
   where: [{ column: "A", op: "eq", value: "AXON" }],
-  set: [{ column: "C", value: 99 }],
+  operations: [{ op: "set", column: "C", value: 99 }],
 });
 assert("AXON matches physical rows → [2, 4]", r1.matched, [2, 4]);
 assert("write occurs", r1.wrote, true);
@@ -216,7 +216,7 @@ console.log("\nPreconditions:");
 const r2 = resolveUpdate(sheetValues, {
   sheet: "Sheet1", headerRows: 1,
   where: [{ column: "A", op: "eq", value: "AXON" }],
-  set: [{ column: "C", value: 99 }],
+  operations: [{ op: "set", column: "C", value: 99 }],
   expectedMatchCount: 1,
 });
 assert("expected_match_count=1, actual=2 → no write", r2.wrote, false);
@@ -225,7 +225,7 @@ assert("rejection reason: expected_match_count", r2.reason, "expected_match_coun
 const r3 = resolveUpdate(sheetValues, {
   sheet: "Sheet1", headerRows: 1,
   where: [{ column: "A", op: "eq", value: "AXON" }],
-  set: [{ column: "C", value: 99 }],
+  operations: [{ op: "set", column: "C", value: 99 }],
   limit: 1,
 });
 assert("limit=1, actual=2 → no write", r3.wrote, false);
@@ -234,7 +234,7 @@ assert("rejection reason: limit", r3.reason, "limit");
 const r4 = resolveUpdate(sheetValues, {
   sheet: "Sheet1", headerRows: 1,
   where: [{ column: "A", op: "eq", value: "NINCS_ILYEN" }],
-  set: [{ column: "C", value: 99 }],
+  operations: [{ op: "set", column: "C", value: 99 }],
 });
 assert("0 matches → no write", r4.wrote, false);
 assert("0 match reason: no_match", r4.reason, "no_match");

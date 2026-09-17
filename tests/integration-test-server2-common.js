@@ -71,49 +71,57 @@ function assert(label, condition, detail) {
 // --- Google lifecycle (local googleapis) ---
 
 export async function createTempSpreadsheet() {
-  return createTempSpreadsheetShared({ locale: "hu_HU", log });
+  return withSheetsQuotaRetry_("createTempSpreadsheet", () =>
+    createTempSpreadsheetShared({ locale: "hu_HU", log })
+  );
 }
 
 export async function deleteTempSpreadsheet(spreadsheetId) {
-  return deleteTempSpreadsheetShared(spreadsheetId, { log });
+  return withSheetsQuotaRetry_("deleteTempSpreadsheet", () =>
+    deleteTempSpreadsheetShared(spreadsheetId, { log })
+  );
 }
 
 async function setupDateTestSheet(spreadsheetId) {
-  const auth = await getGoogleAuth();
-  const sheets = google.sheets({ version: "v4", auth });
-  log(`▶ Adding ${DATE_SHEET} tab with date fixture`);
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    requestBody: {
-      requests: [{ addSheet: { properties: { title: DATE_SHEET } } }],
-    },
+  await withSheetsQuotaRetry_(`setup ${DATE_SHEET}`, async () => {
+    const auth = await getGoogleAuth();
+    const sheets = google.sheets({ version: "v4", auth });
+    log(`▶ Adding ${DATE_SHEET} tab with date fixture`);
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [{ addSheet: { properties: { title: DATE_SHEET } } }],
+      },
+    });
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${DATE_SHEET}!A1`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: DATE_FIXTURE },
+    });
+    log(`✓ ${DATE_SHEET} fixture written (${DATE_FIXTURE.length - 1} data rows)`);
   });
-  await sheets.spreadsheets.values.update({
-    spreadsheetId,
-    range: `${DATE_SHEET}!A1`,
-    valueInputOption: "USER_ENTERED",
-    requestBody: { values: DATE_FIXTURE },
-  });
-  log(`✓ ${DATE_SHEET} fixture written (${DATE_FIXTURE.length - 1} data rows)`);
 }
 
 async function setupGvizTestSheet(spreadsheetId) {
-  const auth = await getGoogleAuth();
-  const sheets = google.sheets({ version: "v4", auth });
-  log(`▶ Adding ${GVIZ_SHEET} tab with GViz fixture`);
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    requestBody: {
-      requests: [{ addSheet: { properties: { title: GVIZ_SHEET } } }],
-    },
+  await withSheetsQuotaRetry_(`setup ${GVIZ_SHEET}`, async () => {
+    const auth = await getGoogleAuth();
+    const sheets = google.sheets({ version: "v4", auth });
+    log(`▶ Adding ${GVIZ_SHEET} tab with GViz fixture`);
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [{ addSheet: { properties: { title: GVIZ_SHEET } } }],
+      },
+    });
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${GVIZ_SHEET}!A1`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: GVIZ_FIXTURE },
+    });
+    log(`✓ ${GVIZ_SHEET} fixture written (${GVIZ_FIXTURE.length - 1} data rows)`);
   });
-  await sheets.spreadsheets.values.update({
-    spreadsheetId,
-    range: `${GVIZ_SHEET}!A1`,
-    valueInputOption: "USER_ENTERED",
-    requestBody: { values: GVIZ_FIXTURE },
-  });
-  log(`✓ ${GVIZ_SHEET} fixture written (${GVIZ_FIXTURE.length - 1} data rows)`);
 }
 
 function queryFirstCell(queryRes, colIndex = 0) {
@@ -129,6 +137,63 @@ function assertNumber(label, actual, expected) {
 }
 
 // --- MCP client (http / https) ---
+
+/** Free-tier Sheets often ~60 read req/min/user — suite exceeds that without pacing. */
+const MCP_TEST_MIN_INTERVAL_MS = Math.max(
+  0,
+  Number(process.env.MCP_TEST_MIN_INTERVAL_MS ?? 600)
+);
+const MCP_TEST_QUOTA_RETRIES = Math.max(
+  1,
+  Number(process.env.MCP_TEST_QUOTA_RETRIES ?? 8)
+);
+
+let lastSheetsTouchAt = 0;
+
+function sleep_(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isQuotaMessage_(s) {
+  return /Quota exceeded|RATE_LIMIT|rateLimitExceeded|429/i.test(String(s || ""));
+}
+
+async function throttleSheetsTouch_() {
+  if (MCP_TEST_MIN_INTERVAL_MS <= 0) return;
+  const wait = lastSheetsTouchAt + MCP_TEST_MIN_INTERVAL_MS - Date.now();
+  if (wait > 0) await sleep_(wait);
+  lastSheetsTouchAt = Date.now();
+}
+
+/**
+ * Pace + retry Google Sheets quota (MCP tool errors and thrown API errors).
+ * @template T
+ * @param {string} label
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+async function withSheetsQuotaRetry_(label, fn) {
+  let lastErr;
+  for (let attempt = 0; attempt < MCP_TEST_QUOTA_RETRIES; attempt++) {
+    await throttleSheetsTouch_();
+    try {
+      const out = await fn();
+      // tools/call often returns isError text instead of throwing
+      if (out && typeof out === "object" && out.isError && isQuotaMessage_(out.text)) {
+        lastErr = new Error(String(out.text).slice(0, 240));
+      } else {
+        return out;
+      }
+    } catch (e) {
+      if (!isQuotaMessage_(e && e.message)) throw e;
+      lastErr = e;
+    }
+    const delay = Math.min(60_000, 4_000 * 2 ** attempt);
+    log(`⏳ Sheets quota (${label}) — retry ${attempt + 1}/${MCP_TEST_QUOTA_RETRIES} in ${Math.round(delay / 1000)}s`);
+    await sleep_(delay);
+  }
+  throw lastErr || new Error(`Sheets quota exhausted after retries (${label})`);
+}
 
 function parseMcpBody(raw) {
   const trimmed = raw.trim();
@@ -193,17 +258,21 @@ async function initializeSession(baseUrl) {
 }
 
 async function callTool(baseUrl, sessionId, name, args) {
-  const res = await mcpRequest(baseUrl, "tools/call", { name, arguments: args }, sessionId);
-  if (res.payload?.error) {
-    throw new Error(`tools/call error: ${JSON.stringify(res.payload.error)}`);
-  }
-  const result = res.payload?.result;
-  const text = result?.content?.[0]?.text;
-  let parsed = null;
-  if (text) {
-    try { parsed = JSON.parse(text); } catch { parsed = text; }
-  }
-  return { result, parsed, isError: !!result?.isError, text };
+  return withSheetsQuotaRetry_(name, async () => {
+    const res = await mcpRequest(baseUrl, "tools/call", { name, arguments: args }, sessionId);
+    if (res.payload?.error) {
+      const msg = JSON.stringify(res.payload.error);
+      if (isQuotaMessage_(msg)) throw new Error(msg);
+      throw new Error(`tools/call error: ${msg}`);
+    }
+    const result = res.payload?.result;
+    const text = result?.content?.[0]?.text;
+    let parsed = null;
+    if (text) {
+      try { parsed = JSON.parse(text); } catch { parsed = text; }
+    }
+    return { result, parsed, isError: !!result?.isError, text };
+  });
 }
 
 function parseReadSheetRows(parsed) {
@@ -221,35 +290,39 @@ function colorsApproxEqual(style, hex) {
 }
 
 async function getGridRowCells(spreadsheetId, a1Range) {
-  const auth = await getGoogleAuth();
-  const sheets = google.sheets({ version: "v4", auth });
-  const res = await sheets.spreadsheets.get({
-    spreadsheetId,
-    ranges: [a1Range],
-    includeGridData: true,
-    fields:
-      "sheets.data.rowData.values(userEnteredFormat,textFormatRuns,formattedValue,userEnteredValue,effectiveValue)",
+  return withSheetsQuotaRetry_(`getGridRowCells ${a1Range}`, async () => {
+    const auth = await getGoogleAuth();
+    const sheets = google.sheets({ version: "v4", auth });
+    const res = await sheets.spreadsheets.get({
+      spreadsheetId,
+      ranges: [a1Range],
+      includeGridData: true,
+      fields:
+        "sheets.data.rowData.values(userEnteredFormat,textFormatRuns,formattedValue,userEnteredValue,effectiveValue)",
+    });
+    return res.data.sheets?.[0]?.data?.[0]?.rowData?.[0]?.values ?? [];
   });
-  return res.data.sheets?.[0]?.data?.[0]?.rowData?.[0]?.values ?? [];
 }
 
 async function setupRichTestSheet(spreadsheetId) {
-  const auth = await getGoogleAuth();
-  const sheets = google.sheets({ version: "v4", auth });
-  log(`▶ Adding ${RICH_SHEET} tab`);
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    requestBody: {
-      requests: [{ addSheet: { properties: { title: RICH_SHEET } } }],
-    },
+  await withSheetsQuotaRetry_(`setup ${RICH_SHEET}`, async () => {
+    const auth = await getGoogleAuth();
+    const sheets = google.sheets({ version: "v4", auth });
+    log(`▶ Adding ${RICH_SHEET} tab`);
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [{ addSheet: { properties: { title: RICH_SHEET } } }],
+      },
+    });
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${RICH_SHEET}!A1`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: [["Ts", "Level", "Message"]] },
+    });
+    log(`✓ ${RICH_SHEET} header written`);
   });
-  await sheets.spreadsheets.values.update({
-    spreadsheetId,
-    range: `${RICH_SHEET}!A1`,
-    valueInputOption: "USER_ENTERED",
-    requestBody: { values: [["Ts", "Level", "Message"]] },
-  });
-  log(`✓ ${RICH_SHEET} header written`);
 }
 
 // --- Test cases ---
@@ -262,11 +335,11 @@ export async function runAllTests({ baseUrl, label }) {
   let sheetName = "Sheet1";
 
   const timeout = setTimeout(() => {
-    console.error(`\n${logPrefix}✗ Timeout: tests did not finish in 180s`);
+    console.error(`\n${logPrefix}✗ Timeout: tests did not finish in 15m`);
     process.exit(1);
-  }, 180_000);
-
-  log(`▶ Server2 integration tests → ${baseUrl}\n`);
+  }, 900_000);
+  log(`▶ Server2 integration tests → ${baseUrl}`);
+  log(`  Sheets pace: minInterval=${MCP_TEST_MIN_INTERVAL_MS}ms retries=${MCP_TEST_QUOTA_RETRIES}\n`);
 
   try {
     // 0. Temp spreadsheet
@@ -298,7 +371,7 @@ export async function runAllTests({ baseUrl, label }) {
       sheet: sheetName,
       header_rows: 1,
       where: [{ column: "A", op: "eq", value: "AXON" }],
-      set: [{ column: "C", value: 99 }],
+      operations: [{ op: "set", column: "C", value: 99 }],
       dry_run: true,
     });
     assert("dry_run not error", !dryRun.isError, dryRun.text);
@@ -312,7 +385,7 @@ export async function runAllTests({ baseUrl, label }) {
       sheet: sheetName,
       header_rows: 1,
       where: [{ column: "A", op: "eq", value: "AXON" }],
-      set: [{ column: "C", value: 99 }],
+      operations: [{ op: "set", column: "C", value: 99 }],
       expected_match_count: 2,
     });
     assert("update_where write not error", !writeUpdate.isError, writeUpdate.text);
@@ -335,7 +408,7 @@ export async function runAllTests({ baseUrl, label }) {
       sheet: sheetName,
       header_rows: 1,
       where: [{ column: "A", op: "eq", value: "NINCS_ILYEN" }],
-      set: [{ column: "C", value: 0 }],
+      operations: [{ op: "set", column: "C", value: 0 }],
     });
     assert("0 match not error", !zeroMatch.isError, zeroMatch.text);
     assert("0 match matched_rows=0", zeroMatch.parsed?.matched_rows === 0);
@@ -346,7 +419,7 @@ export async function runAllTests({ baseUrl, label }) {
       sheet: sheetName,
       header_rows: 1,
       where: [{ column: "A", op: "eq", value: "AXON" }],
-      set: [{ column: "C", value: 1 }],
+      operations: [{ op: "set", column: "C", value: 1 }],
       expected_match_count: 1,
     });
     assert("expected_match_count isError", expectFail.isError);
@@ -358,11 +431,272 @@ export async function runAllTests({ baseUrl, label }) {
       sheet: sheetName,
       header_rows: 1,
       where: [{ column: "A", op: "eq", value: "AXON" }],
-      set: [{ column: "C", value: 1 }],
+      operations: [{ op: "set", column: "C", value: 1 }],
       limit: 1,
     });
     assert("limit isError", limitFail.isError);
     assert("limit updated_rows=0", limitFail.parsed?.updated_rows === 0);
+
+    // 9b. DEV-TODO 64 — op:replace + hard break (temp sheet only)
+    const longCtx =
+      "x".repeat(80) +
+      " bekcerülés " +
+      "y".repeat(80) +
+      " more context around the typo for bit-identity check";
+    const seedReplace = await callTool(baseUrl, sessionId, "write_sheet", {
+      url_or_id: spreadsheetId,
+      range: `${sheetName}!D1`,
+      values: [
+        ["Ctx"],
+        ["clean axon"],
+        ["clean nvo"],
+        ["clean axon2"],
+        [longCtx],
+      ],
+    });
+    assert("replace fixture write ok", !seedReplace.isError, seedReplace.text);
+
+    const replaceDry = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      where: [{ column: "A", op: "eq", value: "ANET" }],
+      operations: [{ op: "replace", column: "D", find: "bekcerülés", replace: "bekerülés" }],
+      dry_run: true,
+      expected_match_count: 1,
+      expected_occurrence_count: 1,
+    });
+    assert("replace dry_run not error", !replaceDry.isError, replaceDry.text);
+    assert("replace dry_run matched=1", replaceDry.parsed?.matched_rows === 1, JSON.stringify(replaceDry.parsed));
+    assert("replace dry_run occurrence=1", replaceDry.parsed?.occurrence_count === 1, JSON.stringify(replaceDry.parsed));
+    assert(
+      "replace dry_run has snippet",
+      !!replaceDry.parsed?.preview?.[0]?.replace?.[0]?.snippet?.match,
+      JSON.stringify(replaceDry.parsed?.preview)
+    );
+
+    const replaceWrite = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      where: [{ column: "A", op: "eq", value: "ANET" }],
+      operations: [{ op: "replace", column: "D", find: "bekcerülés", replace: "bekerülés" }],
+      expected_match_count: 1,
+      expected_occurrence_count: 1,
+    });
+    assert("replace write not error", !replaceWrite.isError, replaceWrite.text);
+
+    const confirmReplace = await callTool(baseUrl, sessionId, "query_sheet", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      query: "SELECT A, D WHERE A = 'ANET'",
+    });
+    const anetCtx = confirmReplace.parsed?.rows?.[0]?.[1];
+    assert("replace CONFIRM bekerülés", typeof anetCtx === "string" && anetCtx.includes("bekerülés"), JSON.stringify(confirmReplace.parsed));
+    assert("replace CONFIRM no old typo", typeof anetCtx === "string" && !anetCtx.includes("bekcerülés"), anetCtx);
+    assert(
+      "replace CONFIRM surroundings",
+      typeof anetCtx === "string" && anetCtx.includes("x".repeat(80)) && anetCtx.includes("y".repeat(80)),
+      anetCtx
+    );
+
+    // Re-seed multi-row replace case
+    await callTool(baseUrl, sessionId, "write_sheet", {
+      url_or_id: spreadsheetId,
+      range: `${sheetName}!D2:D5`,
+      values: [["has bekcerülés a"], ["nope"], ["has bekcerülés b"], ["nope2"]],
+    });
+    const multiOk = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      where: [{ column: "D", op: "not_empty" }],
+      operations: [{ op: "replace", column: "D", find: "bekcerülés", replace: "bekerülés" }],
+      expected_match_count: 2,
+      dry_run: true,
+    });
+    assert("replace multi expected 2 ok", !multiOk.isError, multiOk.text);
+    assert("replace multi matched=2", multiOk.parsed?.matched_rows === 2, JSON.stringify(multiOk.parsed));
+
+    const multiAbort = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      where: [{ column: "D", op: "not_empty" }],
+      operations: [{ op: "replace", column: "D", find: "bekcerülés", replace: "bekerülés" }],
+      expected_match_count: 3,
+      dry_run: true,
+    });
+    assert("replace multi expected 3 abort", multiAbort.isError, multiAbort.text);
+
+    await callTool(baseUrl, sessionId, "write_sheet", {
+      url_or_id: spreadsheetId,
+      range: `${sheetName}!E2`,
+      values: [["foo X foo X foo"]],
+    });
+    const repAll = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      where: [{ column: "A", op: "eq", value: "AXON" }],
+      operations: [{ op: "replace", column: "E", find: "X", replace: "Y", replace_all: true }],
+      limit: 1,
+      expected_match_count: 1,
+    });
+    // First AXON only due to limit? limit refuses if matchBasis > limit. Two AXON rows both have E empty except we only wrote E2.
+    // E2 is first AXON; second AXON E4 empty — replace on empty won't contain X. So matched=1.
+    assert("replace_all write ok", !repAll.isError, repAll.text);
+    const e2read = await callTool(baseUrl, sessionId, "read_sheet", {
+      url_or_id: spreadsheetId,
+      range: `${sheetName}!E2`,
+    });
+    const e2val = parseReadSheetRows(e2read.parsed)?.[0]?.[0];
+    assert("replace_all both X→Y", e2val === "foo Y foo Y foo", JSON.stringify(e2val));
+
+    await callTool(baseUrl, sessionId, "write_sheet", {
+      url_or_id: spreadsheetId,
+      range: `${sheetName}!E3`,
+      values: [["foo X foo X foo"]],
+    });
+    const repFirst = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      where: [{ column: "A", op: "eq", value: "NVO" }],
+      operations: [{ op: "replace", column: "E", find: "X", replace: "Y", replace_all: false }],
+      expected_match_count: 1,
+      expected_occurrence_count: 1,
+    });
+    assert("replace_all false ok", !repFirst.isError, repFirst.text);
+    const e3read = await callTool(baseUrl, sessionId, "read_sheet", {
+      url_or_id: spreadsheetId,
+      range: `${sheetName}!E3`,
+    });
+    assert(
+      "replace_all false only first",
+      parseReadSheetRows(e3read.parsed)?.[0]?.[0] === "foo Y foo X foo",
+      JSON.stringify(e3read.parsed)
+    );
+
+    const noHit = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      where: [{ column: "A", op: "eq", value: "NVO" }],
+      operations: [{ op: "replace", column: "D", find: "NO_SUCH_SUBSTRING_XYZ", replace: "z" }],
+      expected_match_count: 1,
+      dry_run: true,
+    });
+    assert("no-hit expected_match abort", noHit.isError, noHit.text);
+
+    const mixedOps = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      where: [{ column: "A", op: "eq", value: "NVO" }],
+      operations: [
+        { op: "set", column: "B", value: "MIXED" },
+        { op: "replace", column: "D", find: "nope", replace: "yep" },
+      ],
+      expected_match_count: 1,
+    });
+    assert("mixed set+replace ok", !mixedOps.isError, mixedOps.text);
+
+    const legacySet = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      where: [{ column: "A", op: "eq", value: "AXON" }],
+      set: [{ column: "C", value: 1 }],
+    });
+    assert("legacy set hard break isError", legacySet.isError, legacySet.text);
+    assert("legacy set message", /hard break/i.test(legacySet.text || ""), legacySet.text);
+
+    // 9c. Soft blockers from DEV-TODO 64 review — formula / non-string / final decimal
+    const formulaRefuse = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      where: [{ column: "A", op: "eq", value: "AXON" }],
+      operations: [{ op: "set", column: "B", value: "=SUM(A1)" }],
+      dry_run: true,
+      limit: 1,
+    });
+    assert("formula refuse isError", formulaRefuse.isError, formulaRefuse.text);
+    assert("formula refuse message", /formula character/i.test(formulaRefuse.text || ""), formulaRefuse.text);
+
+    const formulaAllow = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      where: [{ column: "A", op: "eq", value: "NVO" }],
+      operations: [{ op: "set", column: "B", value: "=1+1" }],
+      allow_formula: true,
+      expected_match_count: 1,
+    });
+    assert("allow_formula write ok", !formulaAllow.isError, formulaAllow.text);
+
+    const nonStringReplace = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      where: [{ column: "A", op: "eq", value: "AXON" }],
+      operations: [{ op: "replace", column: "C", find: "99", replace: "100" }],
+      dry_run: true,
+    });
+    assert("non-string replace refuse", nonStringReplace.isError, nonStringReplace.text);
+    assert(
+      "non-string replace message",
+      /string \(or empty\)/i.test(nonStringReplace.text || ""),
+      nonStringReplace.text
+    );
+
+    await callTool(baseUrl, sessionId, "write_sheet", {
+      url_or_id: spreadsheetId,
+      range: `${sheetName}!F2`,
+      values: [["xx"]],
+    });
+    const finalDecimal = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      where: [{ column: "A", op: "eq", value: "AXON" }],
+      operations: [{ op: "replace", column: "F", find: "xx", replace: "29.3" }],
+      dry_run: true,
+      limit: 1,
+      expected_match_count: 1,
+    });
+    assert("final-cell 29.3 refuse", finalDecimal.isError, finalDecimal.text);
+    assert(
+      "final-cell 29.3 message",
+      /29\.3/.test(finalDecimal.text || "") && /allow_text_numerics/i.test(finalDecimal.text || ""),
+      finalDecimal.text
+    );
+
+    const expectFailDry = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: sheetName,
+      header_rows: 1,
+      where: [{ column: "A", op: "eq", value: "AXON" }],
+      operations: [{ op: "set", column: "B", value: "X" }],
+      expected_match_count: 1,
+      dry_run: true,
+    });
+    assert("precondition dry_run flag true", expectFailDry.parsed?.dry_run === true, JSON.stringify(expectFailDry.parsed));
+
+    const opsSchema = (await mcpRequest(baseUrl, "tools/list", {}, sessionId)).payload?.result?.tools
+      ?.find((t) => t.name === "update_where");
+    assert(
+      "update_where schema has operations",
+      !!opsSchema?.inputSchema?.properties?.operations,
+      JSON.stringify(opsSchema?.inputSchema?.properties)
+    );
+    assert(
+      "update_where schema no top-level set",
+      !opsSchema?.inputSchema?.properties?.set,
+      JSON.stringify(opsSchema?.inputSchema?.properties)
+    );
 
     // 10. query_sheet — GViz text-number + decimal normalization (production bug regression)
     await setupGvizTestSheet(spreadsheetId);
@@ -491,7 +825,7 @@ export async function runAllTests({ baseUrl, label }) {
         { column: "A", op: "eq", value: "TOOL_TEST" },
         { column: "D", op: "lt", value: "2026-07-11" },
       ],
-      set: [{ column: "C", value: "DRY" }],
+      operations: [{ op: "set", column: "C", value: "DRY" }],
     });
     assert("update_where date where dry_run not error", !dateWhereDry.isError, dateWhereDry.text);
     assert("update_where date where matched_rows=1", dateWhereDry.parsed?.matched_rows === 1, JSON.stringify(dateWhereDry.parsed));
@@ -506,7 +840,7 @@ export async function runAllTests({ baseUrl, label }) {
         { column: "A", op: "eq", value: "TOOL_TEST" },
         { column: "D", op: "lt", value: "2026-07-10" },
       ],
-      set: [{ column: "C", value: "DRY" }],
+      operations: [{ op: "set", column: "C", value: "DRY" }],
     });
     assert("update_where date where miss not error", !dateWhereMiss.isError, dateWhereMiss.text);
     assert("update_where date where miss matched_rows=0", dateWhereMiss.parsed?.matched_rows === 0, JSON.stringify(dateWhereMiss.parsed));
@@ -691,21 +1025,23 @@ export async function runAllTests({ baseUrl, label }) {
     // 14. insert_rows type regression: number, bool, formula, empty, special characters
     // Dedicated tab so we do not corrupt the Sheet1 fixture.
     const PARSE_SHEET = "ParseTest";
-    const authForParse = await getGoogleAuth();
-    const sheetsForParse = google.sheets({ version: "v4", auth: authForParse });
-    await sheetsForParse.spreadsheets.batchUpdate({
-      spreadsheetId,
-      requestBody: {
-        requests: [{ addSheet: { properties: { title: PARSE_SHEET } } }],
-      },
-    });
-    await sheetsForParse.spreadsheets.values.update({
-      spreadsheetId,
-      range: `${PARSE_SHEET}!A1`,
-      valueInputOption: "USER_ENTERED",
-      requestBody: {
-        values: [["Label", "Num", "Flag", "Formula", "Note"]],
-      },
+    await withSheetsQuotaRetry_(`setup ${PARSE_SHEET}`, async () => {
+      const authForParse = await getGoogleAuth();
+      const sheetsForParse = google.sheets({ version: "v4", auth: authForParse });
+      await sheetsForParse.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: {
+          requests: [{ addSheet: { properties: { title: PARSE_SHEET } } }],
+        },
+      });
+      await sheetsForParse.spreadsheets.values.update({
+        spreadsheetId,
+        range: `${PARSE_SHEET}!A1`,
+        valueInputOption: "USER_ENTERED",
+        requestBody: {
+          values: [["Label", "Num", "Flag", "Formula", "Note"]],
+        },
+      });
     });
 
     const insertParse = await callTool(baseUrl, sessionId, "insert_rows", {
@@ -925,6 +1261,25 @@ export async function runAllTests({ baseUrl, label }) {
       JSON.stringify(msgCell?.userEnteredValue)
     );
 
+    // DEV-TODO 64: rich text refuse on update_where replace/set
+    const richRefuse = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: RICH_SHEET,
+      header_rows: 1,
+      where: [{ column: "B", op: "eq", value: "ERROR" }],
+      operations: [{ op: "replace", column: "C", find: "timeout", replace: "TIMEOUT" }],
+      dry_run: true,
+      expected_match_count: 1,
+    });
+    assert("rich replace refuse isError", richRefuse.isError, richRefuse.text);
+    assert("rich replace refuse message", /textFormatRuns/i.test(richRefuse.text || ""), richRefuse.text);
+    const richUnchanged = await getGridRowCells(spreadsheetId, `${RICH_SHEET}!C2`);
+    assert(
+      "rich cell unchanged after refuse",
+      (richUnchanged[0]?.textFormatRuns?.length ?? 0) >= 2,
+      JSON.stringify(richUnchanged[0]?.textFormatRuns)
+    );
+
     // insert_rows hybrid (below header)
     const richInsert = await callTool(baseUrl, sessionId, "insert_rows", {
       url_or_id: spreadsheetId,
@@ -1053,13 +1408,13 @@ export async function runAllTests({ baseUrl, label }) {
       sheet: RICH_SHEET,
       header_rows: 0,
       where: [{ column: "A", op: "eq", value: "TOOL_TEST" }],
-      set: [{ column: "B", value: "29.3" }],
+      operations: [{ op: "set", column: "B", value: "29.3" }],
       dry_run: true,
     });
     assert("update_where dry_run rejects \"29.3\" in set", dryDotBad.isError, dryDotBad.text);
     assert(
       "update_where dry_run error useful",
-      /set\[0\] B/i.test(dryDotBad.text || "") && /allow_text_numerics/i.test(dryDotBad.text || ""),
+      /operations\[0\] set B/i.test(dryDotBad.text || "") && /allow_text_numerics/i.test(dryDotBad.text || ""),
       dryDotBad.text
     );
 

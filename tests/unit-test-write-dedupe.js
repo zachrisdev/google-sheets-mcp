@@ -150,7 +150,7 @@ await withWriteDedupe({
   spreadsheetId: "SID",
   args: {},
   skipDedupe: true,
-  fingerprintPayload: { set: [{ column: "A", value: 1 }] },
+  fingerprintPayload: { operations: [{ op: "set", column: "A", value: 1 }] },
   run: async () => {
     runs++;
     return { content: [{ type: "text", text: "{}" }] };
@@ -161,7 +161,7 @@ await withWriteDedupe({
   spreadsheetId: "SID",
   args: {},
   skipDedupe: true,
-  fingerprintPayload: { set: [{ column: "A", value: 1 }] },
+  fingerprintPayload: { operations: [{ op: "set", column: "A", value: 1 }] },
   run: async () => {
     runs++;
     return { content: [{ type: "text", text: "{}" }] };

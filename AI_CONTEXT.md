@@ -31,7 +31,7 @@ Model Context Protocol (MCP) server exposing the Google Sheets API to Claude (lo
 | `get_sheet_info` | Metadata (tab names, dimensions) |
 | `clear_range` | Clear a range |
 | `query_sheet` | SQLite `SELECT` on a tab via Sheets API → ephemeral sql.js. Columns A, B, C…; table = tab name (`FROM` optional) |
-| `update_where` | Filter + update in one server call (`where` + `set`). Options: `dry_run`, `limit`, `expected_match_count` |
+| `update_where` | Filter + column ops (`where` + `operations`). Ops: `set` (overwrite) \| `replace` (literal in-cell). Options: `dry_run`, `limit`, `expected_match_count`, `expected_occurrence_count`, `allow_formula`. Rich-text cells refused. |
 
 ## Run modes
 
@@ -127,7 +127,9 @@ Schema: table = tab name; columns = A, B, C…; `FROM` optional; `contains` → 
 
 ### 5b. Why `update_where`
 
-`query_sheet` does not return physical row indices. `update_where` reads → filters → writes in one call. Sheets API has no true transactions; use `expected_match_count`, `limit`, `dry_run`.
+`query_sheet` does not return physical row indices. `update_where` reads → filters → applies `operations` in one call. Sheets API has no true transactions; use `expected_match_count`, `expected_occurrence_count`, `limit`, `dry_run`.
+
+**Hard break (DEV-TODO 64):** top-level `set` removed. Use `operations: [{ op: "set", column, value }]` or `{ op: "replace", column, find, replace }`. After deploy: **re-attach the MCP connector** (Desktop / Claude.ai) so the client schema refreshes.
 
 ### 5c. `update_where` date/datetime `where` values (DEV-TODO 38)
 
@@ -138,6 +140,18 @@ Cells arrive as Sheets serials (`UNFORMATTED_VALUE`). Where values may be:
 - numeric serial (e.g. `46240`) — unchanged
 
 Comparison is numeric on serials (exact). Day-range: `gte` day + `lt` next day. A date-looking but unparseable value throws (no silent `matched_rows: 0`).
+
+### 5d. `update_where` operations / replace (DEV-TODO 64)
+
+- `op:"set"` — full cell overwrite (`column` + `value`).
+- `op:"replace"` — literal in-cell find/replace (`find` minLength 1, `replace` may be empty, `replace_all` default true). **No regex.**
+- Replace targets must be **string or empty**; number / boolean / date-serial → explicit error (checked on every where-matched row for that column, even if `find` is absent — narrow `where` first).
+- Cells with `textFormatRuns` → **refused** (plain `values.batchUpdate` only; formatting support is a separate backlog).
+- Decimal guard: foreign-decimal text on `set` values **and** on final cell text when the **entire** trimmed cell matches (not substrings in long context).
+- Leading `= + - @` on set value / post-replace text → refused unless `allow_formula: true`.
+- `dry_run` preview includes replace snippets (±40 chars) and `occurrence_count` (= **applied** replacements; with `replace_all:false` at most 1 per cell).
+- Replace-only: `expected_match_count` / `limit` apply to rows that **contain** `find` (among where matches).
+- **Same column, multiple ops in one call:** not a pipeline. Each `replace` reads the **original** cell; write Map is last-wins per `column+row`. Prefer one op per column per call.
 
 ### 6. Locale-aware decimal text guard
 
