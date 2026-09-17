@@ -16,6 +16,8 @@ import {
   formatSheetsSerialDate,
   inferQueryColType,
   isSheetsDateSerial,
+  looksLikeDateString,
+  parseDateishToSerial,
 } from "./sheet-helpers.js";
 import { executeSheetSqlQuery } from "./sheet-sql.js";
 import {
@@ -41,7 +43,11 @@ export {
   formatSheetsSerialDate,
   inferQueryColType,
   isSheetsDateSerial,
-};
+  looksLikeDateString,
+  parseDateishToSerial,
+  utcPartsToSheetsSerial,
+} from "./sheet-helpers.js";
+// Keep evaluateCondition / rowMatches below as local exports.
 export {
   executeSheetSqlQuery,
   prepareSheetSql,
@@ -124,27 +130,77 @@ export function evaluateCondition(cell, op, value) {
     case "contains":
       return String(cell ?? "").toLowerCase().includes(String(value ?? "").toLowerCase());
     case "eq":
-    case "ne": {
-      const cn = coerceNumber(cell);
-      const vn = coerceNumber(value);
-      const equal = cn !== null && vn !== null ? cn === vn : String(cell ?? "") === String(value ?? "");
-      return op === "eq" ? equal : !equal;
-    }
+    case "ne":
     case "gt":
     case "gte":
     case "lt":
     case "lte": {
-      const cn = coerceNumber(cell);
-      const vn = coerceNumber(value);
-      if (cn === null || vn === null) return false;
-      if (op === "gt") return cn > vn;
-      if (op === "gte") return cn >= vn;
-      if (op === "lt") return cn < vn;
-      return cn <= vn;
+      if (looksLikeDateString(value) && parseDateishToSerial(value) === null) {
+        throw new Error(
+          `where: value is not a valid date for comparison: ${JSON.stringify(String(value))}`
+        );
+      }
+
+      const cellSerial =
+        typeof cell === "number" && isSheetsDateSerial(cell)
+          ? cell
+          : parseDateishToSerial(cell);
+      const valueSerial = parseDateishToSerial(value);
+      const cellNum = coerceNumber(cell);
+      const valueNum = coerceNumber(value);
+      const relational = op === "gt" || op === "gte" || op === "lt" || op === "lte";
+
+      // Date path: ISO/serial value and/or Sheets date-serial cell.
+      if (valueSerial !== null || cellSerial !== null) {
+        if (valueSerial !== null) {
+          const cn = cellSerial !== null ? cellSerial : cellNum;
+          if (cn === null) {
+            if (!relational) {
+              const equal = String(cell ?? "") === String(value ?? "");
+              return op === "eq" ? equal : !equal;
+            }
+            throw new Error(
+              `where: cannot compare non-numeric/empty cell with date value ${JSON.stringify(String(value))}`
+            );
+          }
+          return compareNums(cn, valueSerial, op);
+        }
+        // cell is date-serial; value is not dateish
+        if (valueNum !== null) {
+          return compareNums(cellSerial, valueNum, op);
+        }
+        if (!relational) {
+          const equal = String(cell ?? "") === String(value ?? "");
+          return op === "eq" ? equal : !equal;
+        }
+        throw new Error(
+          `where: cannot compare date cell with non-date value ${JSON.stringify(String(value ?? ""))}`
+        );
+      }
+
+      // Legacy number / string path
+      if (relational) {
+        if (cellNum === null || valueNum === null) return false;
+        return compareNums(cellNum, valueNum, op);
+      }
+      const equal =
+        cellNum !== null && valueNum !== null
+          ? cellNum === valueNum
+          : String(cell ?? "") === String(value ?? "");
+      return op === "eq" ? equal : !equal;
     }
     default:
       throw new Error(`Unknown operator: ${op}`);
   }
+}
+
+function compareNums(cn, vn, op) {
+  if (op === "eq") return cn === vn;
+  if (op === "ne") return cn !== vn;
+  if (op === "gt") return cn > vn;
+  if (op === "gte") return cn >= vn;
+  if (op === "lt") return cn < vn;
+  return cn <= vn;
 }
 
 // Does a single row (array of cell values) match the where conditions?

@@ -51,10 +51,88 @@ export function isSheetsDateSerial(n) {
   return typeof n === "number" && !Number.isNaN(n) && n >= 30000 && n < 60000;
 }
 
+const SHEETS_EPOCH_MS = Date.UTC(1899, 11, 30);
+
+/** UTC Y/M/D[/h/mi/s] → Sheets serial (same epoch as formatSheetsSerialDate). */
+export function utcPartsToSheetsSerial(year, month0, day, h = 0, mi = 0, s = 0) {
+  const ms = Date.UTC(year, month0, day, h, mi, s);
+  return (ms - SHEETS_EPOCH_MS) / 86400000;
+}
+
+/**
+ * True if a string looks like an ISO date/datetime or GViz Date(...) —
+ * even when calendar-invalid (e.g. 2026-13-99). Used for fail-fast.
+ */
+export function looksLikeDateString(v) {
+  if (typeof v !== "string") return false;
+  const t = v.trim();
+  if (!t) return false;
+  if (/^Date\(\d+/i.test(t)) return true;
+  return /^\d{4}-\d{2}-\d{2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?)?$/.test(t);
+}
+
+/**
+ * Coerce a where-value or cell to a Sheets date serial, or null if not dateish.
+ * - number in serial range → itself
+ * - ISO `YYYY-MM-DD` → that day 00:00 UTC
+ * - ISO `YYYY-MM-DD[T ]HH:MM[:SS]` → fractional serial
+ * - GViz `Date(y,m,d[,h,mi,s])` (month 0-based)
+ */
+export function parseDateishToSerial(v) {
+  if (v === null || v === undefined || v === "") return null;
+  if (typeof v === "number") {
+    return isSheetsDateSerial(v) ? v : null;
+  }
+  if (typeof v !== "string") return null;
+  const t = v.trim();
+  if (!t) return null;
+
+  const gviz = t.match(/^Date\((\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+),\s*(\d+),\s*(\d+))?\)$/);
+  if (gviz) {
+    const year = Number(gviz[1]);
+    const month0 = Number(gviz[2]);
+    const day = Number(gviz[3]);
+    const h = gviz[4] !== undefined ? Number(gviz[4]) : 0;
+    const mi = gviz[5] !== undefined ? Number(gviz[5]) : 0;
+    const sec = gviz[6] !== undefined ? Number(gviz[6]) : 0;
+    const ms = Date.UTC(year, month0, day, h, mi, sec);
+    const d = new Date(ms);
+    if (
+      d.getUTCFullYear() !== year ||
+      d.getUTCMonth() !== month0 ||
+      d.getUTCDate() !== day
+    ) {
+      return null;
+    }
+    return utcPartsToSheetsSerial(year, month0, day, h, mi, sec);
+  }
+
+  const iso = t.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (!iso) return null;
+  const year = Number(iso[1]);
+  const month0 = Number(iso[2]) - 1;
+  const day = Number(iso[3]);
+  const h = iso[4] !== undefined ? Number(iso[4]) : 0;
+  const mi = iso[5] !== undefined ? Number(iso[5]) : 0;
+  const sec = iso[6] !== undefined ? Number(iso[6]) : 0;
+  const ms = Date.UTC(year, month0, day, h, mi, sec);
+  const d = new Date(ms);
+  if (
+    d.getUTCFullYear() !== year ||
+    d.getUTCMonth() !== month0 ||
+    d.getUTCDate() !== day ||
+    d.getUTCHours() !== h ||
+    d.getUTCMinutes() !== mi ||
+    d.getUTCSeconds() !== sec
+  ) {
+    return null;
+  }
+  return utcPartsToSheetsSerial(year, month0, day, h, mi, sec);
+}
+
 export function formatSheetsSerialDate(serial) {
   if (typeof serial !== "number" || Number.isNaN(serial)) return serial;
-  const epochMs = Date.UTC(1899, 11, 30);
-  const ms = epochMs + Math.round(serial * 86400000);
+  const ms = SHEETS_EPOCH_MS + Math.round(serial * 86400000);
   const d = new Date(ms);
   const pad = (n) => String(n).padStart(2, "0");
   const dateStr = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;

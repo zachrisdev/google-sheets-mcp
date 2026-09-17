@@ -129,6 +129,16 @@ Schema: table = tab name; columns = A, B, C…; `FROM` optional; `contains` → 
 
 `query_sheet` does not return physical row indices. `update_where` reads → filters → writes in one call. Sheets API has no true transactions; use `expected_match_count`, `limit`, `dry_run`.
 
+### 5c. `update_where` date/datetime `where` values (DEV-TODO 38)
+
+Cells arrive as Sheets serials (`UNFORMATTED_VALUE`). Where values may be:
+
+- ISO date `YYYY-MM-DD` → that day **00:00** UTC serial
+- ISO datetime `YYYY-MM-DD HH:MM[:SS]` or `T` separator → fractional serial
+- numeric serial (e.g. `46240`) — unchanged
+
+Comparison is numeric on serials (exact). Day-range: `gte` day + `lt` next day. A date-looking but unparseable value throws (no silent `matched_rows: 0`).
+
 ### 6. Locale-aware decimal text guard
 
 On write tools, the server reads `spreadsheets.get` → `properties.locale` (cached per process by spreadsheet ID).

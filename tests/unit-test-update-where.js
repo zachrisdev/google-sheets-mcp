@@ -24,6 +24,9 @@ import {
   rowMatches,
   toUserEnteredValue,
   valuesToRowData,
+  parseDateishToSerial,
+  looksLikeDateString,
+  formatSheetsSerialDate,
 } from "../index.js";
 
 let passed = 0;
@@ -38,6 +41,27 @@ function assert(label, actual, expected) {
     console.error(`  ✗ ${label}`);
     console.error(`      expected: ${JSON.stringify(expected)}`);
     console.error(`      actual:   ${JSON.stringify(actual)}`);
+    failed++;
+  }
+}
+
+function assertThrows(label, fn, msgIncludes) {
+  let threw = false;
+  let msg = "";
+  try {
+    fn();
+  } catch (e) {
+    threw = true;
+    msg = String(e && e.message ? e.message : e);
+  }
+  const ok = threw && (!msgIncludes || msg.includes(msgIncludes));
+  if (ok) {
+    console.log(`  ✓ ${label}`);
+    passed++;
+  } else {
+    console.error(`  ✗ ${label}`);
+    console.error(`      expected throw${msgIncludes ? ` containing ${JSON.stringify(msgIncludes)}` : ""}`);
+    console.error(`      threw=${threw} msg=${JSON.stringify(msg)}`);
     failed++;
   }
 }
@@ -107,6 +131,56 @@ assert("empty: null → true", evaluateCondition(null, "empty"), true);
 assert("empty: undefined → true", evaluateCondition(undefined, "empty"), true);
 assert("not_empty: 'x' → true", evaluateCondition("x", "not_empty"), true);
 assert("gt comma decimal: '23,3' > 20 → true", evaluateCondition("23,3", "gt", 20), true);
+
+console.log("\nparseDateishToSerial / looksLikeDateString:");
+const serialAug6 = parseDateishToSerial("2026-08-06");
+const serialAug5_2130 = parseDateishToSerial("2026-08-05 21:30:00");
+const serialAug5_2200 = parseDateishToSerial("2026-08-05 22:00:00");
+assert("bare date → number serial", typeof serialAug6, "number");
+assert("bare date formats back to YYYY-MM-DD", formatSheetsSerialDate(serialAug6), "2026-08-06");
+assert("datetime formats with time", formatSheetsSerialDate(serialAug5_2130), "2026-08-05 21:30:00");
+assert("looksLikeDateString ISO date", looksLikeDateString("2026-08-06"), true);
+assert("looksLikeDateString ISO datetime", looksLikeDateString("2026-08-05 21:30"), true);
+assert("looksLikeDateString ticker → false", looksLikeDateString("AXON"), false);
+assert("invalid calendar date → null", parseDateishToSerial("2026-13-99"), null);
+assert("looksLike invalid calendar still true", looksLikeDateString("2026-13-99"), true);
+
+console.log("\nevaluateCondition datetime (DEV-TODO 38 repro):");
+assert("lt: Aug5 21:30 < '2026-08-06' → true", evaluateCondition(serialAug5_2130, "lt", "2026-08-06"), true);
+assert("lt: Aug5 22:00 < '2026-08-06' → true", evaluateCondition(serialAug5_2200, "lt", "2026-08-06"), true);
+assert("lt: Aug6 00:00 < '2026-08-06' → false", evaluateCondition(serialAug6, "lt", "2026-08-06"), false);
+assert("gte: Aug6 >= '2026-08-06' → true", evaluateCondition(serialAug6, "gte", "2026-08-06"), true);
+assert("gt: Aug5 21:30 > '2026-08-06' → false", evaluateCondition(serialAug5_2130, "gt", "2026-08-06"), false);
+assert("lte: Aug5 21:30 <= '2026-08-06' → true", evaluateCondition(serialAug5_2130, "lte", "2026-08-06"), true);
+assert("eq: Aug6 == '2026-08-06' → true", evaluateCondition(serialAug6, "eq", "2026-08-06"), true);
+assert("eq: Aug5 21:30 == '2026-08-06' → false (exact serial)", evaluateCondition(serialAug5_2130, "eq", "2026-08-06"), false);
+assert("eq: Aug5 21:30 == '2026-08-05 21:30:00' → true", evaluateCondition(serialAug5_2130, "eq", "2026-08-05 21:30:00"), true);
+assert("eq: serial value vs ISO → true", evaluateCondition(serialAug6, "eq", serialAug6), true);
+assert("lt: serial value 46240-style → true", evaluateCondition(serialAug5_2130, "lt", serialAug6), true);
+assert("T-separator datetime", evaluateCondition(serialAug5_2130, "lt", "2026-08-06T00:00:00"), true);
+
+assertThrows(
+  "invalid ISO-looking value → throw",
+  () => evaluateCondition(serialAug6, "lt", "2026-13-99"),
+  "not a valid date"
+);
+assertThrows(
+  "date cell + non-date relational → throw",
+  () => evaluateCondition(serialAug6, "lt", "AXON"),
+  "non-date value"
+);
+assert("date cell + ticker eq → string false (no throw)", evaluateCondition(serialAug6, "eq", "AXON"), false);
+
+console.log("\nrowMatches datetime AND (repro-shaped):");
+const alertRowO = ["x", true, "O", "O", "DATUM_EARNINGS", serialAug5_2130];
+const alertRowMeli = ["x", true, "MELI", "MELI", "DATUM_EARNINGS", serialAug5_2200];
+const alertWhere = [
+  { column: "E", op: "eq", value: "DATUM_EARNINGS" },
+  { column: "B", op: "eq", value: true },
+  { column: "F", op: "lt", value: "2026-08-06" },
+];
+assert("row O matches F lt ISO", rowMatches(alertRowO, alertWhere, "AND"), true);
+assert("row MELI matches F lt ISO", rowMatches(alertRowMeli, alertWhere, "AND"), true);
 
 console.log("\nrowMatches (AND / OR):");
 const row = ["AXON", "AR_TARGET", 150, true, "", 25];

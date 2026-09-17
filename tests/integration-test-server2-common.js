@@ -480,6 +480,37 @@ export async function runAllTests({ baseUrl, label }) {
       JSON.stringify(dateQuery.parsed?.rows?.[0])
     );
 
+    // 10c. update_where — ISO date where vs UNFORMATTED serial cell (DEV-TODO 38)
+    const dateWhereDry = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: DATE_SHEET,
+      header_rows: 1,
+      dry_run: true,
+      expected_match_count: 1,
+      where: [
+        { column: "A", op: "eq", value: "TOOL_TEST" },
+        { column: "D", op: "lt", value: "2026-07-11" },
+      ],
+      set: [{ column: "C", value: "DRY" }],
+    });
+    assert("update_where date where dry_run not error", !dateWhereDry.isError, dateWhereDry.text);
+    assert("update_where date where matched_rows=1", dateWhereDry.parsed?.matched_rows === 1, JSON.stringify(dateWhereDry.parsed));
+    assert("update_where date where dry_run updated_rows=0", dateWhereDry.parsed?.updated_rows === 0);
+
+    const dateWhereMiss = await callTool(baseUrl, sessionId, "update_where", {
+      url_or_id: spreadsheetId,
+      sheet: DATE_SHEET,
+      header_rows: 1,
+      dry_run: true,
+      where: [
+        { column: "A", op: "eq", value: "TOOL_TEST" },
+        { column: "D", op: "lt", value: "2026-07-10" },
+      ],
+      set: [{ column: "C", value: "DRY" }],
+    });
+    assert("update_where date where miss not error", !dateWhereMiss.isError, dateWhereMiss.text);
+    assert("update_where date where miss matched_rows=0", dateWhereMiss.parsed?.matched_rows === 0, JSON.stringify(dateWhereMiss.parsed));
+
     // 11. query_sheet regression (update_where fixture)
     const queryRes = await callTool(baseUrl, sessionId, "query_sheet", {
       url_or_id: spreadsheetId,
