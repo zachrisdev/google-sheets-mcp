@@ -179,3 +179,66 @@ Optional `request_id` on write tools; see `write-dedupe.js`.
 
 - Never commit `credentials.json` / `token.json` / gateway `config.json`
 - Gateway tokens are secrets in the URL path — treat logs carefully
+
+## Sibling PMon repo — marketdata / S&P 500 TR DB (post-reorg)
+
+This MCP stack (`zachrisdev/mcp-stack` / `google-sheets-mcp`) is a **separate git repo**. PMon’s `.gitignore` excludes `MCP/`. The relocation commit `e97f7db` lives in the **PMon** repo, not here. Paths below are relative to the PMon checkout when that sibling tree is available. Do **not** use the old path `data/sp500_tr_db`.
+
+Coverage / gap status (873/1097, missing crisis names, paid next steps): see PMon `marketdata/equities/sp500_tr_db/out/SUMMARY_10_lines.md` — do not guess from chat memory.
+
+### Paths (PMon repo root)
+
+| What | Path |
+|------|------|
+| S&P 500 monthly TR DB | `marketdata/equities/sp500_tr_db/` |
+| Builder + fetchers | `…/build_db.py`, `…/fetch_*.py` |
+| Git-tracked outputs | `…/out/*.csv`, `…/out/*.md` (incl. `prices_monthly.csv`) |
+| Local-only (gitignored) | `…/raw/`, `…/cache/` |
+| Release registry | `marketdata/releases.json`, `marketdata/MANIFEST.sha256.txt` |
+| Release tooling | `marketdata/tools/releases.py` |
+| Trim backtest (BEF-151) | `backtests/trim_bef151/` (reads `marketdata/equities/sp500_tr_db/out/`) |
+| Details | `marketdata/README.md` |
+
+Depth: `sp500_tr_db` is **three** levels below the PMon repo root (`marketdata/equities/sp500_tr_db`). Secret file resolution in `build_db.py` / `fetch_*.py`:
+
+```text
+ROOT.parents[2] / "secrets" / "exth_api_keys.env"
+```
+
+If that folder depth changes, update the parent index in those five scripts.
+
+### Environment after move / clone
+
+The project `.venv` may still hold Windows absolute paths from the old location. Before any Python run in that folder:
+
+```powershell
+cd marketdata\equities\sp500_tr_db
+uv sync
+```
+
+Then use `uv run python …` (or the refreshed `.venv`).
+
+### Git hygiene (PMon)
+
+- **Never** `git add -A` in PMon: `secrets/` and `plans/` are untracked on purpose. Always stage **explicit paths**.
+- After editing `.gitignore` or other text files on a Windows checkout, check `git diff --stat`. An unexpectedly large diff often means CRLF/LF line-ending churn (seen when git ran from a VM rewritten every line).
+
+### Git vs GitHub Releases (PMon)
+
+| Tracked in git | Not in git (GitHub Releases) |
+|----------------|------------------------------|
+| Code, `uv.lock`, `out/*.csv` / `out/*.md`, `releases.json`, `MANIFEST.sha256.txt` | `raw/`, `cache/` (nested + root `.gitignore`) |
+
+- One release asset per source (tags listed in `marketdata/releases.json`).
+- Run `package` / `publish` on the **Windows host** with authenticated `gh` (not over a network/mounted drive — large-tree zips are very slow there). From PMon repo root:  
+  `python marketdata/tools/releases.py package --only <tag>`  
+  then `publish --only <tag>`, then commit the updated `MANIFEST.sha256.txt` with an **explicit** `git add` path.
+- New source → new row in `releases.json` first. Full workflow: `marketdata/README.md`.
+
+### Diagnostics scripts
+
+Former `cache/_diag_*.py` files are ignored with `cache/`. If they must be versioned, move them to a tracked folder such as `marketdata/equities/sp500_tr_db/diag/` (not under `cache/`).
+
+### Contract for consumers (do not break casually)
+
+`backtests/trim_bef151/` depends on `out/prices_monthly.csv`, `out/benchmark.csv`, `out/membership.csv` **column names and formats**. Do not rename/reshape those without coordinating; if you must change them, call it out explicitly in the session handoff.
