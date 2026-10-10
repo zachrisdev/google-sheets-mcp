@@ -1,8 +1,11 @@
 /**
- * One-shot: Stratégiák Tech/AI keret-összesítő (DEV-TODO STRATEGIAK_FUL).
+ * One-shot LEGACY: Stratégiák Tech/AI keret-összesítő (DEV-TODO STRATEGIAK_FUL).
  * - Expand grid + AF column + summary block AH:AK
  * - Data validation AF (0/50/100)
  * - Conditional formatting on utilization % (yellow ≥90%, red ≥100%)
+ *
+ * ⚠ Élő út: Apps Script writeKeretRangesOnly_ / writeKeretSummary_ + getStratPad_().
+ * NE futtasd, ha STRAT_PAD ≠ 207 (hardcode T2:T207 / endRowIndex 207) — divergál.
  *
  * Usage: node scripts/apply-tech-ai-keret.js
  */
