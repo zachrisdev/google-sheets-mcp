@@ -121,9 +121,12 @@ Nginx must not embed the token; gateway checks `config.json` timing-safe. Token 
 GViz `/gviz/tq` respects UI `basicFilter` / hidden rows → silent false negatives. Production path:
 
 1. `spreadsheets.values.get` (`UNFORMATTED_VALUE`) — same source as `update_where`
-2. Ephemeral in-memory sql.js
+2. Parallel `values.get` with the same `UNFORMATTED_VALUE` plus `dateTimeRenderOption=FORMATTED_STRING` (DATE/TIME/DATE_TIME/DURATION → string; number/currency/percent stay numeric) — builds the date column mask
+3. Ephemeral in-memory sql.js
 
 Schema: table = tab name; columns = A, B, C…; `FROM` optional; `contains` → `LIKE`.
+
+**`col_types` (DEV-078):** from the format mask + SELECT-expression classification — not from “value looks like a Sheets serial (30000–60000)”. Bare columns and `MIN`/`MAX`(col) inherit the column’s date-ness (incl. `AS` alias); every other expression (`SUM`/`AVG`/`COUNT`/arithmetic/functions) is never `date`. Mixed columns (any plain number beside a date-formatted cell) → `number` (raw serials, no false ISO). TIME/DURATION also hit the date mask in v1 (separate type is backlog). Without the formatted matrix (unit/smoke 4-arg calls) a load-time serial heuristic remains — pure HUF columns in-range can still look like `date`; production `query_sheet` always passes the formatted matrix.
 
 ### 5b. Why `update_where`
 

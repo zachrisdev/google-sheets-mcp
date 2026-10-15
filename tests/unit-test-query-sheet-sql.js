@@ -13,6 +13,9 @@ import {
   assertSelectOnly,
   formatSheetsSerialDate,
   isSheetsDateSerial,
+  buildDateColumnMask,
+  splitSelectList,
+  classifySelectExpr,
 } from "../index.js";
 
 let passed = 0;
@@ -298,6 +301,199 @@ console.log("\nEdge cases (string literals / empty / bool vs 0-1):");
   const lim = await executeSheetSqlQuery(mixed, 1, "GvizTest", "SELECT C LIMIT 1");
   assert("mixed col LIMIT 1 → number", lim.col_types[0], "number");
   assert("mixed col LIMIT 1 value 100", lim.rows[0][0], 100);
+}
+
+console.log("\nDEV-078 date typing (format mask):");
+{
+  // Number-formatted serial-range values must stay number (production bug: ENPH X / HUF).
+  const numSheet = [
+    ["Label", "Amt"],
+    ["ENPH", 53561],
+    ["X", 58245.911],
+  ];
+  const numFmt = [
+    ["Label", "Amt"],
+    ["ENPH", 53561],
+    ["X", 58245.911],
+  ];
+  const one = await executeSheetSqlQuery(
+    numSheet,
+    1,
+    "T",
+    "SELECT B WHERE A = 'ENPH'",
+    numFmt
+  );
+  assert("53561 col_type number", one.col_types[0], "number");
+  assert("53561 value stays number", one.rows[0][0], 53561);
+
+  const sum = await executeSheetSqlQuery(numSheet, 1, "T", "SELECT SUM(B) AS s", numFmt);
+  assert("SUM(B) col_type number", sum.col_types[0], "number");
+  assertTrue("SUM(B) numeric", typeof sum.rows[0][0] === "number", JSON.stringify(sum.rows));
+
+  const frac = await executeSheetSqlQuery(
+    numSheet,
+    1,
+    "T",
+    "SELECT B WHERE A = 'X'",
+    numFmt
+  );
+  assert("58245.911 col_type number", frac.col_types[0], "number");
+  assert("58245.911 value", frac.rows[0][0], 58245.911);
+
+  // Date-formatted column (fmt cell is string).
+  const dateSheet = [
+    ["Tool", "Action", "Status", "Date"],
+    ["A", "x", "OK", 46213],
+    ["B", "y", "OK", 46220],
+    ["C", "z", "OK", 46210],
+  ];
+  const dateFmt = [
+    ["Tool", "Action", "Status", "Date"],
+    ["A", "x", "OK", "2026-07-10"],
+    ["B", "y", "OK", "2026-07-17"],
+    ["C", "z", "OK", "2026-07-07"],
+  ];
+  const d1 = await executeSheetSqlQuery(
+    dateSheet,
+    1,
+    "DateTest",
+    "SELECT D WHERE A = 'B'",
+    dateFmt
+  );
+  assert("date-fmt col_type", d1.col_types[0], "date");
+  assert("date-fmt ISO", d1.rows[0][0], "2026-07-17");
+
+  const maxD = await executeSheetSqlQuery(dateSheet, 1, "DateTest", "SELECT MAX(D)", dateFmt);
+  assert("MAX(D) date", maxD.col_types[0], "date");
+  const maxAlias = await executeSheetSqlQuery(
+    dateSheet,
+    1,
+    "DateTest",
+    "SELECT MAX ( D ) AS last",
+    dateFmt
+  );
+  assert("MAX ( D ) AS last date", maxAlias.col_types[0], "date");
+  const minLow = await executeSheetSqlQuery(dateSheet, 1, "DateTest", "SELECT min(d)", dateFmt);
+  assert("min(d) date", minLow.col_types[0], "date");
+
+  const cnt = await executeSheetSqlQuery(dateSheet, 1, "DateTest", "SELECT COUNT(D)", dateFmt);
+  assert("COUNT(D) number", cnt.col_types[0], "number");
+  const avg = await executeSheetSqlQuery(dateSheet, 1, "DateTest", "SELECT AVG(D)", dateFmt);
+  assert("AVG(D) number", avg.col_types[0], "number");
+
+  const star = await executeSheetSqlQuery(dateSheet, 1, "DateTest", "SELECT *", dateFmt);
+  assert("SELECT * Date col date", star.col_types[3], "date");
+
+  // Parser: comma inside string literal must not shift columns.
+  // Use non-numeric text so cellToSqlValue does not coerce "1,2" → 1.2.
+  const replaceSheet = [
+    ["A", "B", "C", "D"],
+    ["a,b", "x", "y", 46213],
+  ];
+  const replaceFmt = [
+    ["A", "B", "C", "D"],
+    ["a,b", "x", "y", "2026-07-10"],
+  ];
+  const repl = await executeSheetSqlQuery(
+    replaceSheet,
+    1,
+    "T",
+    "SELECT REPLACE(A, ',', ''), D",
+    replaceFmt
+  );
+  assert("REPLACE+D types", repl.col_types, ["string", "date"]);
+  assert("REPLACE value", repl.rows[0][0], "ab");
+  assert("D still date ISO", repl.rows[0][1], "2026-07-10");
+
+  // Mixed column → number (no false ISO).
+  const mixedSheet = [
+    ["V"],
+    [46213],
+    [100],
+  ];
+  const mixedFmt = [
+    ["V"],
+    ["2026-07-10"],
+    [100],
+  ];
+  const mixed = await executeSheetSqlQuery(mixedSheet, 1, "T", "SELECT A", mixedFmt);
+  assert("mixed col → number", mixed.col_types[0], "number");
+  assert("mixed keeps serial", mixed.rows[0][0], 46213);
+
+  // Jagged / sparse formatted matrix — no throw, no false date.
+  const jaggedRaw = [
+    ["A", "B"],
+    [53561, 46213],
+    [40000],
+  ];
+  const jaggedFmt = [
+    ["A", "B"],
+    [53561],
+    // missing row 2 entirely
+  ];
+  let jaggedOk = true;
+  let jaggedRes;
+  try {
+    jaggedRes = await executeSheetSqlQuery(
+      jaggedRaw,
+      1,
+      "T",
+      "SELECT A, B WHERE A = 53561",
+      jaggedFmt
+    );
+  } catch (e) {
+    jaggedOk = false;
+    assertTrue("jagged fmt no throw", false, e.message);
+  }
+  if (jaggedOk) {
+    assertTrue("jagged fmt no throw", true);
+    assert("jagged A number", jaggedRes.col_types[0], "number");
+    assertTrue(
+      "jagged B not false date ISO",
+      jaggedRes.col_types[1] !== "date" && jaggedRes.col_types[1] !== "datetime",
+      JSON.stringify(jaggedRes)
+    );
+  }
+
+  // Fallback without formatted matrix (4-arg).
+  const fbMixed = [
+    ["V"],
+    [100],
+    [53561],
+  ];
+  const fbNarrow = await executeSheetSqlQuery(
+    fbMixed,
+    1,
+    "T",
+    "SELECT A WHERE A = 53561"
+  );
+  assert("fallback mixed narrow → number", fbNarrow.col_types[0], "number");
+  assert("fallback mixed value", fbNarrow.rows[0][0], 53561);
+
+  // Known limit: pure in-range serials without fmt still look like date.
+  const fbPure = [
+    ["V"],
+    [53561],
+    [40000],
+  ];
+  const fbPureRes = await executeSheetSqlQuery(fbPure, 1, "T", "SELECT A");
+  assert("fallback known-limit still date", fbPureRes.col_types[0], "date");
+
+  // Helpers
+  const mask = buildDateColumnMask(dateSheet, dateFmt, 1);
+  assertTrue("mask D true", mask.D === true, JSON.stringify(mask));
+  assertTrue("mask A false", mask.A === false, JSON.stringify(mask));
+  const items = splitSelectList(
+    prepareSheetSql("SELECT REPLACE(A, ',', ''), D", "T")
+  );
+  assertTrue(
+    "splitSelectList 2 items",
+    items && items.length === 2,
+    JSON.stringify(items)
+  );
+  assert("classify bare", classifySelectExpr("D").kind, "bare");
+  assert("classify MAX inherit", classifySelectExpr("MAX(D)").kind, "inherit");
+  assert("classify SUM never", classifySelectExpr("SUM(D)").kind, "never_date");
 }
 
 console.log(`\n${"─".repeat(40)}`);

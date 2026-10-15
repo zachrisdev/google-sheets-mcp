@@ -69,6 +69,10 @@ export {
   ensureFromClause,
   assertSelectOnly,
   maskSqlStringLiterals,
+  buildDateColumnMask,
+  splitSelectList,
+  classifySelectExpr,
+  classifyResultColumn,
 } from "./sheet-sql.js";
 export {
   ALLOW_TEXT_NUMERICS_PROP,
@@ -646,7 +650,10 @@ export function createMcpServer() {
           "Examples: SELECT C, COUNT(*) FROM Alerts WHERE C = 'AMZN' GROUP BY C; " +
           "SELECT * WHERE C = 'AMZN' ORDER BY A DESC LIMIT 20; " +
           "SELECT A WHERE A contains 'hun' (→ LIKE). " +
-          "Supports WHERE/GROUP BY/ORDER BY/LIMIT and COUNT/SUM/AVG/MIN/MAX. Single table only. Returns {columns, col_types, matched_rows, rows}.",
+          "Supports WHERE/GROUP BY/ORDER BY/LIMIT and COUNT/SUM/AVG/MIN/MAX. Single table only. " +
+          "Returns {columns, col_types, matched_rows, rows}. " +
+          "col_types come from Sheets cell formats (date/datetime vs number) plus SELECT-expression rules " +
+          "(bare/MIN/MAX inherit; other exprs never date).",
         inputSchema: {
           type: "object",
           properties: {
@@ -971,20 +978,32 @@ export function createMcpServer() {
         // 2026-07-24: GViz (/gviz/tq) silently respected UI basicFilter → false-negative
         // WHERE matches (AMZN 0 vs 6). Load via Sheets API (same as update_where),
         // run SQLite SELECT in ephemeral sql.js (aggregations, no GViz).
+        // DEV-078: second get keeps UNFORMATTED_VALUE but adds dateTimeRenderOption=FORMATTED_STRING
+        // so DATE/TIME/DATE_TIME/DURATION cells arrive as strings → date column mask (never valueRenderOption formatted).
         const headerRows = args.header_rows !== undefined ? parseInt(args.header_rows) : 0;
+        const range = `${args.sheet}!A:ZZ`;
 
-        const sheetRes = await sheets.spreadsheets.values.get({
-          spreadsheetId,
-          range: `${args.sheet}!A:ZZ`,
-          valueRenderOption: "UNFORMATTED_VALUE",
-        });
+        const [sheetRes, sheetFmtRes] = await Promise.all([
+          sheets.spreadsheets.values.get({
+            spreadsheetId,
+            range,
+            valueRenderOption: "UNFORMATTED_VALUE",
+          }),
+          sheets.spreadsheets.values.get({
+            spreadsheetId,
+            range,
+            valueRenderOption: "UNFORMATTED_VALUE",
+            dateTimeRenderOption: "FORMATTED_STRING",
+          }),
+        ]);
 
         try {
           const result = await executeSheetSqlQuery(
             sheetRes.data.values || [],
             headerRows,
             args.sheet,
-            args.query
+            args.query,
+            sheetFmtRes.data.values || []
           );
           return {
             content: [{

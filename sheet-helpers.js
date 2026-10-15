@@ -141,7 +141,14 @@ export function formatSheetsSerialDate(serial) {
   return `${dateStr} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
 }
 
-export function inferQueryColType(values) {
+/**
+ * Infer col_types from values.
+ * @param {unknown[]} values
+ * @param {{ allowDate?: boolean }} [options] allowDate default true (compat / load-time).
+ *   When false, serial-range numbers stay `number` (DEV-078 result typing).
+ */
+export function inferQueryColType(values, options = {}) {
+  const allowDate = options.allowDate !== false;
   const nonEmpty = values.filter((v) => v !== null && v !== undefined && v !== "");
   if (nonEmpty.length === 0) return "string";
   if (
@@ -152,7 +159,7 @@ export function inferQueryColType(values) {
   ) {
     return "boolean";
   }
-  if (nonEmpty.every((v) => isSheetsDateSerial(v))) {
+  if (allowDate && nonEmpty.every((v) => isSheetsDateSerial(v))) {
     return nonEmpty.some((v) => Math.abs(v % 1) >= 1e-10) ? "datetime" : "date";
   }
   if (nonEmpty.every((v) => typeof v === "number" || coerceNumber(v) !== null)) {

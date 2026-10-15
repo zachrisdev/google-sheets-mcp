@@ -14,7 +14,6 @@ import {
   coerceNumber,
   formatQueryCell,
   inferQueryColType,
-  isSheetsDateSerial,
 } from "./sheet-helpers.js";
 
 /** @type {Promise<import("sql.js").SqlJsStatic> | null} */
@@ -232,27 +231,175 @@ export async function loadSheetIntoSql(sheetValues, headerRows, sheetName) {
   return { db, width, header, colLetters, loadColTypes };
 }
 
-function refineResultColType(colName, values, sheetColSet, loadTypeByLetter) {
+/**
+ * Per-column date-format mask from Sheets cell formats.
+ * A cell is date-formatted when raw is number and formatted is a non-empty string
+ * (UNFORMATTED_VALUE + dateTimeRenderOption=FORMATTED_STRING).
+ * Column is date iff ≥1 numeric data cell is date-formatted and none is plain number.
+ * Mixed → not date. Sparse-safe (missing row/index/undefined → not date-formatted).
+ *
+ * @returns {{ [letter: string]: boolean }}
+ */
+export function buildDateColumnMask(rawRows, fmtRows, headerRows) {
+  const raw = rawRows || [];
+  const fmt = fmtRows || [];
+  const width = Math.max(
+    0,
+    ...raw.map((r) => (r ? r.length : 0)),
+    ...fmt.map((r) => (r ? r.length : 0))
+  );
+  const mask = {};
+  for (let ci = 0; ci < width; ci++) {
+    const letter = colIndexToLetter(ci);
+    let sawDateFmt = false;
+    let sawPlainNumber = false;
+    const maxRows = Math.max(raw.length, fmt.length);
+    for (let ri = headerRows; ri < maxRows; ri++) {
+      const rawVal = raw[ri]?.[ci];
+      if (typeof rawVal !== "number" || Number.isNaN(rawVal)) continue;
+      const fmtVal = fmt[ri]?.[ci];
+      if (typeof fmtVal === "string" && fmtVal !== "") {
+        sawDateFmt = true;
+      } else {
+        sawPlainNumber = true;
+      }
+    }
+    mask[letter] = sawDateFmt && !sawPlainNumber;
+  }
+  return mask;
+}
+
+/** Strip trailing `AS alias` (string-literal-safe). */
+function stripTrailingAsAlias(expr) {
+  const masked = maskSqlStringLiterals(expr);
+  const m = masked.match(/\s+as\s+[A-Za-z_][A-Za-z0-9_]*\s*$/i);
+  if (m && m.index !== undefined) return expr.slice(0, m.index).trim();
+  return String(expr).trim();
+}
+
+/**
+ * Split prepared SELECT list into expressions (comma at depth 0).
+ * Uses string-literal-masked SQL for structure; returns raw slices.
+ * @returns {string[] | null}
+ */
+export function splitSelectList(preparedSql) {
+  const sql = String(preparedSql);
+  const masked = maskSqlStringLiterals(sql);
+  const selectMatch = masked.match(/^\s*select\s+/i);
+  if (!selectMatch) return null;
+  let start = selectMatch[0].length;
+  const distinctMatch = masked.slice(start).match(/^distinct\s+/i);
+  if (distinctMatch) start += distinctMatch[0].length;
+
+  let depth = 0;
+  let end = masked.length;
+  for (let i = start; i < masked.length; i++) {
+    const ch = masked[i];
+    if (ch === "(") depth++;
+    else if (ch === ")") depth = Math.max(0, depth - 1);
+    else if (depth === 0) {
+      const rest = masked.slice(i);
+      const kw = rest.match(/^(from|where|group\s+by|having|order\s+by|limit)\b/i);
+      if (kw) {
+        end = i;
+        break;
+      }
+    }
+  }
+
+  const listMasked = masked.slice(start, end);
+  const listRaw = sql.slice(start, end);
+  const items = [];
+  let itemStart = 0;
+  depth = 0;
+  for (let i = 0; i < listMasked.length; i++) {
+    const ch = listMasked[i];
+    if (ch === "(") depth++;
+    else if (ch === ")") depth = Math.max(0, depth - 1);
+    else if (ch === "," && depth === 0) {
+      items.push(stripTrailingAsAlias(listRaw.slice(itemStart, i)));
+      itemStart = i + 1;
+    }
+  }
+  items.push(stripTrailingAsAlias(listRaw.slice(itemStart)));
+  return items.filter((s) => s.length > 0);
+}
+
+/**
+ * Classify a SELECT expression for date inheritance.
+ * @returns {{ kind: "bare"|"inherit"|"never_date"|"star", letter?: string }}
+ */
+export function classifySelectExpr(expr) {
+  const e = String(expr).trim();
+  if (e === "*" || /\.\*$/.test(e)) return { kind: "star" };
+  if (/^[A-Za-z]{1,3}$/.test(e)) return { kind: "bare", letter: e.toUpperCase() };
+  const minMax = e.match(/^(MIN|MAX)\s*\(\s*([A-Za-z]{1,3})\s*\)$/i);
+  if (minMax) return { kind: "inherit", letter: minMax[2].toUpperCase() };
+  return { kind: "never_date" };
+}
+
+function dateOrDatetimeFromValues(values) {
+  const nums = values.filter((v) => typeof v === "number" && !Number.isNaN(v));
+  if (nums.length === 0) return "date";
+  return nums.some((v) => Math.abs(v % 1) >= 1e-10) ? "datetime" : "date";
+}
+
+/**
+ * Result column typing (DEV-078): format-mask + SELECT-expression classification.
+ * Without format mask: load-time date heuristic on full columns (test/compat only).
+ */
+export function classifyResultColumn(
+  colName,
+  values,
+  sheetColSet,
+  loadTypeByLetter,
+  dateColumnMask,
+  selectKind,
+  selectLetter
+) {
   const upper = String(colName).toUpperCase();
   // Only force load-time type for real booleans (avoids 0/1 number cols → true/false).
-  // Mixed number/text columns stay result-inferred (SELECT C LIMIT 1 → number if that cell is numeric).
   if (sheetColSet.has(upper) && loadTypeByLetter[upper] === "boolean") {
     return "boolean";
   }
   if (values.every((v) => v === null || v === undefined || v === "")) return "string";
-  if (values.some((v) => isSheetsDateSerial(v))) {
-    const nonEmpty = values.filter((v) => v !== null && v !== undefined && v !== "");
-    if (nonEmpty.length && nonEmpty.every((v) => isSheetsDateSerial(v))) {
-      return nonEmpty.some((v) => Math.abs(v % 1) >= 1e-10) ? "datetime" : "date";
+
+  const letterForDate =
+    selectKind === "bare" || selectKind === "inherit"
+      ? selectLetter
+      : selectKind === "name_fallback" && sheetColSet.has(upper)
+        ? upper
+        : null;
+
+  let isDateCol = false;
+  if (selectKind === "never_date") {
+    isDateCol = false;
+  } else if (letterForDate) {
+    if (dateColumnMask) {
+      isDateCol = dateColumnMask[letterForDate] === true;
+    } else {
+      const loadT = loadTypeByLetter[letterForDate];
+      isDateCol = loadT === "date" || loadT === "datetime";
     }
   }
-  return inferQueryColType(values);
+
+  if (isDateCol) return dateOrDatetimeFromValues(values);
+  return inferQueryColType(values, { allowDate: false });
 }
 
 /**
  * Run prepared SELECT; format cells (dates→ISO, nums, bools).
+ * @param {{ [letter: string]: boolean } | null} [dateColumnMask] from buildDateColumnMask; null = fallback
  */
-export function runSheetSql(db, preparedSql, header, sheetColSet = new Set(), loadColTypes = [], colLetters = []) {
+export function runSheetSql(
+  db,
+  preparedSql,
+  header,
+  sheetColSet = new Set(),
+  loadColTypes = [],
+  colLetters = [],
+  dateColumnMask = null
+) {
   let colNames;
   let projectedRaw;
   try {
@@ -277,14 +424,38 @@ export function runSheetSql(db, preparedSql, header, sheetColSet = new Set(), lo
     loadTypeByLetter[letter] = loadColTypes[i] || "string";
   });
 
-  const colTypes = colNames.map((name, ci) =>
-    refineResultColType(
+  const selectItems = splitSelectList(preparedSql);
+  const useNameFallback =
+    !selectItems ||
+    selectItems.length !== colNames.length ||
+    selectItems.some((item) => classifySelectExpr(item).kind === "star");
+
+  const colTypes = colNames.map((name, ci) => {
+    let selectKind;
+    let selectLetter;
+    if (useNameFallback) {
+      selectKind = "name_fallback";
+      selectLetter = undefined;
+    } else {
+      const classified = classifySelectExpr(selectItems[ci]);
+      if (classified.kind === "bare" || classified.kind === "inherit") {
+        selectKind = classified.kind;
+        selectLetter = classified.letter;
+      } else {
+        selectKind = "never_date";
+        selectLetter = undefined;
+      }
+    }
+    return classifyResultColumn(
       name,
       projectedRaw.map((r) => r[ci]),
       sheetColSet,
-      loadTypeByLetter
-    )
-  );
+      loadTypeByLetter,
+      dateColumnMask,
+      selectKind,
+      selectLetter
+    );
+  });
 
   const rows = projectedRaw.map((row) =>
     row.map((v, i) => formatQueryCell(v, colTypes[i]))
@@ -300,8 +471,11 @@ export function runSheetSql(db, preparedSql, header, sheetColSet = new Set(), lo
   };
 }
 
-/** Full pipeline: load → prepare → run → discard DB. */
-export async function executeSheetSqlQuery(sheetValues, headerRows, sheetName, query) {
+/**
+ * Full pipeline: load → prepare → run → discard DB.
+ * @param {unknown[][]} [formattedValues] parallel values.get with dateTimeRenderOption=FORMATTED_STRING
+ */
+export async function executeSheetSqlQuery(sheetValues, headerRows, sheetName, query, formattedValues) {
   const preparedSql = prepareSheetSql(query, sheetName);
   const { db, header, colLetters, loadColTypes } = await loadSheetIntoSql(
     sheetValues,
@@ -309,8 +483,20 @@ export async function executeSheetSqlQuery(sheetValues, headerRows, sheetName, q
     sheetName
   );
   const sheetColSet = new Set(colLetters);
+  const dateColumnMask =
+    formattedValues !== undefined && formattedValues !== null
+      ? buildDateColumnMask(sheetValues, formattedValues, headerRows)
+      : null;
   try {
-    return runSheetSql(db, preparedSql, header, sheetColSet, loadColTypes, colLetters);
+    return runSheetSql(
+      db,
+      preparedSql,
+      header,
+      sheetColSet,
+      loadColTypes,
+      colLetters,
+      dateColumnMask
+    );
   } finally {
     db.close();
   }

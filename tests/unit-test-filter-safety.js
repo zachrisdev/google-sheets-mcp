@@ -51,6 +51,16 @@ console.log("query_sheet path:");
     /executeSheetSqlQuery/.test(handlerSlice)
   );
   assertTrue(
+    "query_sheet uses dateTimeRenderOption FORMATTED_STRING",
+    /dateTimeRenderOption:\s*"FORMATTED_STRING"/.test(handlerSlice),
+    handlerSlice.match(/dateTimeRenderOption[^\n]*/)?.[0]
+  );
+  assertTrue(
+    "query_sheet handler has no valueRenderOption FORMATTED_VALUE",
+    !/valueRenderOption:\s*"FORMATTED_VALUE"/.test(handlerSlice),
+    handlerSlice.match(/valueRenderOption:\s*"FORMATTED_VALUE"[^\n]*/)?.[0]
+  );
+  assertTrue(
     "query_sheet handler has no gviz/tq fetch/URL",
     !/https?:\/\/[^'"\s]*gviz\/tq|\/gviz\/tq\?/.test(handlerSlice),
     handlerSlice.match(/gviz[^\n]*/)?.[0]

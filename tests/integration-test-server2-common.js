@@ -814,6 +814,58 @@ export async function runAllTests({ baseUrl, label }) {
       JSON.stringify(dateQuery.parsed?.rows?.[0])
     );
 
+    // 10b2. DEV-078 — number-formatted value in Sheets serial range must stay number
+    await withSheetsQuotaRetry_("DEV-078 number format 53561", async () => {
+      const auth = await getGoogleAuth();
+      const sheetsApi = google.sheets({ version: "v4", auth });
+      const meta = await sheetsApi.spreadsheets.get({
+        spreadsheetId,
+        fields: "sheets.properties(sheetId,title)",
+      });
+      const dateSheetId = meta.data.sheets?.find((s) => s.properties?.title === DATE_SHEET)?.properties
+        ?.sheetId;
+      assert("DateTest sheetId found", typeof dateSheetId === "number", JSON.stringify(meta.data.sheets));
+      await sheetsApi.spreadsheets.values.update({
+        spreadsheetId,
+        range: `${DATE_SHEET}!E1:E2`,
+        valueInputOption: "RAW",
+        requestBody: { values: [["Amt"], [53561]] },
+      });
+      await sheetsApi.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: {
+          requests: [
+            {
+              repeatCell: {
+                range: {
+                  sheetId: dateSheetId,
+                  startRowIndex: 1,
+                  endRowIndex: 2,
+                  startColumnIndex: 4,
+                  endColumnIndex: 5,
+                },
+                cell: {
+                  userEnteredFormat: {
+                    numberFormat: { type: "NUMBER", pattern: "#,##0" },
+                  },
+                },
+                fields: "userEnteredFormat.numberFormat",
+              },
+            },
+          ],
+        },
+      });
+    });
+    const numSerialQuery = await callTool(baseUrl, sessionId, "query_sheet", {
+      url_or_id: spreadsheetId,
+      sheet: DATE_SHEET,
+      query: "SELECT E WHERE E = 53561",
+      header_rows: 1,
+    });
+    assert("DEV-078 number query not error", !numSerialQuery.isError, numSerialQuery.text);
+    assert("DEV-078 col_type number", numSerialQuery.parsed?.col_types?.[0] === "number", JSON.stringify(numSerialQuery.parsed));
+    assertNumber("DEV-078 value 53561", numSerialQuery.parsed?.rows?.[0]?.[0], 53561);
+
     // 10c. update_where — ISO date where vs UNFORMATTED serial cell (DEV-TODO 38)
     const dateWhereDry = await callTool(baseUrl, sessionId, "update_where", {
       url_or_id: spreadsheetId,
